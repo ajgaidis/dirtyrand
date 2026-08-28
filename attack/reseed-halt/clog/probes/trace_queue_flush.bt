@@ -1,0 +1,5 @@
+kprobe:tty_insert_flip_string_and_push_buffer {
+	$port = ((struct tty_port *) arg1);
+
+	printf("queueing work for port: %p\n", arg1);
+}

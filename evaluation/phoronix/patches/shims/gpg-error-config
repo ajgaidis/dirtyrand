@@ -1,0 +1,7 @@
+#!/bin/sh
+# Compat shim: Debian 12 dropped gpg-error-config (libgpg-error-dev >= 1.46)
+# in favour of gpgrt-config + pkg-config. GnuPG 2.2.x's m4/gpg-error.m4 still
+# looks for gpg-error-config, so forward to gpgrt-config.
+libdir=$(pkg-config --variable=libdir gpg-error 2>/dev/null)
+[ -n "$libdir" ] || libdir=/usr/lib/$(gcc -print-multiarch 2>/dev/null)
+exec gpgrt-config --libdir="$libdir" gpg-error "$@"

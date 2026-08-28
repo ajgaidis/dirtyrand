@@ -1,0 +1,5 @@
+# Build products (see the clean: rules in Makefile and timing/Makefile).
+tcp-client
+guess-kmod
+exploit
+timing/timing

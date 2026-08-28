@@ -1,0 +1,6 @@
+# Build products (see the clean: rule in Makefile).
+guess-base
+aslr-poc
+aslr-kmod
+read_aslr
+.cache/

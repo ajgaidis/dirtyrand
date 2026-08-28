@@ -1,0 +1,40 @@
+# Build outputs
+*.o
+*.ko
+*.so
+*.mod
+*.mod.c
+*.cmd
+*.order
+*.symvers
+.cache/
+.tmp_versions/
+
+# Generated at build time
+inc/offsets.h
+gadgets.h
+kern_offsets.h
+
+# Built binaries
+exploit
+exploit_*
+offsets
+chacha
+poc_*
+zap_*
+predict_*
+extract_*
+canary_restore_payload
+pty_write
+
+# Fetched or built dependencies
+kernel/linux-6.12.11/
+kernel/linux-*.tar.xz
+kernel/build-*/
+case-studies/canary-user/real-world/musl-1.1.7*/
+case-studies/canary-user/real-world/install/
+rootfs*/
+*.img
+
+# Captured data
+random_data.bin

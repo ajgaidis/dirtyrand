@@ -1,0 +1,12 @@
+kprobe:flush_to_ldisc,
+	/comm != "bpftrace"/
+{
+	@events[nsecs] = comm;
+}
+
+interval:s:5 
+{
+	printf("*** Map dump start ***\n");
+	print(@events);
+	printf("*** Map dump end ***\n");
+}

@@ -1,0 +1,11 @@
+kprobe:tty_insert_flip_string_and_push_buffer,
+kprobe:pty_write,
+kprobe:do_output_char,
+kprobe:n_tty_write,
+kprobe:vfs_write,
+kprobe:ksys_write,
+/comm != "bpftrace" && comm != "sudo"/
+{
+	printf("%s() called by %s (pid: %d)\n", probe, comm, pid);
+}
+

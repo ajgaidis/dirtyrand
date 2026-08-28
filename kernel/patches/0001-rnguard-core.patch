@@ -1,0 +1,1173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous Submission #60 <anon@example.invalid>
+Date: Fri, 28 Aug 2026 12:56:41 -0400
+Subject: [PATCH] RNGuard: isolate the kernel RNG's state behind a hardware
+ gate
+
+RNGuard places the kernel RNG's long-lived state -- the base ChaCha20 key
+(base_crng), the per-CPU generators (crngs) and the four batched-entropy
+pools -- in a dedicated .rnguard_iso section, and wraps every RNG code path
+that touches it in an enable/disable gate pair. Outside a gate window the
+memory is unreadable and unwritable, so an attacker holding an arbitrary
+kernel read-write primitive cannot disclose or corrupt the generator state.
+
+Transient state is covered too. The RNG's working values -- the ChaCha20
+state, the fast-key-erasure first block, the reseed key -- live on the kernel
+stack, where an attacker can race them even while the persistent state is
+sealed. RNGuard therefore switches the stack pointer to a protected per-CPU
+pseudo-stack for the duration of each gate window, which covers compiler
+spills as well as named locals. Interrupts are disabled across the window
+because exception entry would otherwise push a hardware frame onto the
+protected stack.
+
+This patch is the architecture-independent half: the Kconfig options, the
+.rnguard_iso placement macros, and the gate and stack-switch call sites in
+drivers/char/random.c. It is inert on its own -- one of the two backend
+patches that follow supplies the actual hardware mechanism.
+
+With both CONFIG_RNGUARD_* options off, the preprocessed source of
+random.c is upstream's, unchanged: the conditionals are at the call sites
+rather than hidden behind macros that expand to the upstream call.
+---
+ drivers/char/random.c             | 837 ++++++++++++++++++++++++++++++
+ include/asm-generic/vmlinux.lds.h |  20 +
+ include/linux/percpu-defs.h       |  13 +
+ lib/Kconfig.debug                 |  36 ++
+ 4 files changed, 906 insertions(+)
+
+diff --git a/drivers/char/random.c b/drivers/char/random.c
+index 23ee76b..6de231b 100644
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@ -66,6 +66,16 @@
+ #include <asm/irq.h>
+ #include <asm/irq_regs.h>
+ #include <asm/io.h>
++#ifdef CONFIG_RNGUARD_MPK
++#include <linux/percpu-defs.h>
++#include <asm/rnguard_mpk.h>
++#endif
++#ifdef CONFIG_RNGUARD_MTE
++#include <asm/mte-rnguard.h>
++#include <asm/memory.h>
++#include <linux/cpumask.h>
++#include <linux/percpu-defs.h>
++#endif
+ 
+ /*********************************************************************
+  *
+@@ -93,6 +103,22 @@ static DECLARE_WAIT_QUEUE_HEAD(crng_init_wait);
+ static struct fasync_struct *fasync;
+ static ATOMIC_NOTIFIER_HEAD(random_ready_notifier);
+ 
++#ifdef CONFIG_RNGUARD_MTE
++static DEFINE_STATIC_KEY_FALSE(crng_mte_is_ready);
++static void crng_mte_set_ready(void)
++{
++	static_branch_enable(&crng_mte_is_ready);
++}
++#define crng_mte_ready() (static_branch_likely(&crng_mte_is_ready))
++
++#ifdef CONFIG_RNGUARD_MTE_SELFTEST
++static bool rnguard_st_grb_on_stack;
++static bool rnguard_st_gru_on_stack;
++static bool rnguard_st_reseed_on_stack;
++static int rnguard_st_credit_on_stack = -1;
++#endif /* CONFIG_RNGUARD_MTE_SELFTEST */
++#endif /* CONFIG_RNGUARD_MTE */
++
+ /* Control how we warn userspace. */
+ static struct ratelimit_state urandom_warning =
+ 	RATELIMIT_STATE_INIT_FLAGS("urandom_warning", HZ, 3, RATELIMIT_MSG_ON_RELEASE);
+@@ -208,6 +234,7 @@ enum {
+ 	CRNG_RESEED_INTERVAL = 60 * HZ
+ };
+ 
++#if !defined(CONFIG_RNGUARD_MPK) && !defined(CONFIG_RNGUARD_MTE)
+ static struct {
+ 	u8 key[CHACHA_KEY_SIZE] __aligned(__alignof__(long));
+ 	unsigned long generation;
+@@ -215,17 +242,55 @@ static struct {
+ } base_crng = {
+ 	.lock = __SPIN_LOCK_UNLOCKED(base_crng.lock)
+ };
++#else
++#ifdef CONFIG_RNGUARD_MPK
++static struct {
++	u8 key[CHACHA_KEY_SIZE] __aligned(__alignof__(long));
++	unsigned long generation;
++	spinlock_t lock;
++} base_crng __section(".rnguard_iso") = {
++	.lock = __SPIN_LOCK_UNLOCKED(base_crng.lock)
++};
++#endif /* CONFIG_RNGUARD_MPK */
++#ifdef CONFIG_RNGUARD_MTE
++static struct base_crng {
++	u8 key[CHACHA_KEY_SIZE] __aligned(__alignof__(long));
++	unsigned long generation;
++	spinlock_t lock;
++} base_crng __aligned(16) = {
++	.lock = __SPIN_LOCK_UNLOCKED(base_crng.lock)
++};
+ 
++/* Assign the base_crng pointer which we will use throughout random.c */
++static struct base_crng *base_crng_p = &base_crng;
++#endif /* CONFIG_RNGUARD_MTE */
++#endif /* !CONFIG_RNGUARD_MPK && !CONFIG_RNGUARD_MTE */
++
++#ifdef CONFIG_RNGUARD_MTE
++struct crng {
++	u8 key[CHACHA_KEY_SIZE];
++	unsigned long generation;
++	local_lock_t lock;
++} __aligned(16);
++#else
+ struct crng {
+ 	u8 key[CHACHA_KEY_SIZE];
+ 	unsigned long generation;
+ 	local_lock_t lock;
+ };
++#endif
+ 
++#ifdef CONFIG_RNGUARD_MPK
++static DEFINE_PER_CPU_RNGUARD_ISO(struct crng, crngs) = {
++	.generation = ULONG_MAX,
++	.lock = INIT_LOCAL_LOCK(crngs.lock),
++};
++#else
+ static DEFINE_PER_CPU(struct crng, crngs) = {
+ 	.generation = ULONG_MAX,
+ 	.lock = INIT_LOCAL_LOCK(crngs.lock),
+ };
++#endif /* CONFIG_RNGUARD_MPK */
+ 
+ /*
+  * Return the interval until the next reseeding, which is normally
+@@ -250,6 +315,132 @@ static unsigned int crng_reseed_interval(void)
+ /* Used by crng_reseed() and crng_make_state() to extract a new seed from the input pool. */
+ static void extract_entropy(void *buf, size_t len);
+ 
++#ifdef CONFIG_RNGUARD_MPK
++/* This extracts a new crng key from the input pool. */
++static noinline void _crng_reseed(void)
++{
++	unsigned long flags;
++	unsigned long next_gen;
++	u8 key[CHACHA_KEY_SIZE];
++
++	extract_entropy(key, sizeof(key));
++
++	/*
++	 * We copy the new key into the base_crng, overwriting the old one,
++	 * and update the generation counter. We avoid hitting ULONG_MAX,
++	 * because the per-cpu crngs are initialized to ULONG_MAX, so this
++	 * forces new CPUs that come online to always initialize.
++	 */
++	spin_lock_irqsave(&base_crng.lock, flags);
++	memcpy(base_crng.key, key, sizeof(base_crng.key));
++	next_gen = base_crng.generation + 1;
++	if (next_gen == ULONG_MAX)
++		++next_gen;
++	WRITE_ONCE(base_crng.generation, next_gen);
++#ifdef CONFIG_VDSO_GETRANDOM
++	/* base_crng.generation's invalid value is ULONG_MAX, while
++	 * _vdso_rng_data.generation's invalid value is 0, so add one to the
++	 * former to arrive at the latter. Use smp_store_release so that this
++	 * is ordered with the write above to base_crng.generation. Pairs with
++	 * the smp_rmb() before the syscall in the vDSO code.
++	 *
++	 * Cast to unsigned long for 32-bit architectures, since atomic 64-bit
++	 * operations are not supported on those architectures. This is safe
++	 * because base_crng.generation is a 32-bit value. On big-endian
++	 * architectures it will be stored in the upper 32 bits, but that's okay
++	 * because the vDSO side only checks whether the value changed, without
++	 * actually using or interpreting the value.
++	 */
++	smp_store_release((unsigned long *)&__arch_get_k_vdso_rng_data()->generation, next_gen + 1);
++#endif
++	if (!static_branch_likely(&crng_is_ready))
++		crng_init = CRNG_READY;
++	spin_unlock_irqrestore(&base_crng.lock, flags);
++
++	memzero_explicit(key, sizeof(key));
++}
++
++static void crng_reseed(struct work_struct *work)
++{
++	static DECLARE_DELAYED_WORK(next_reseed, crng_reseed);
++	unsigned long flags;
++
++	/* Immediately schedule the next reseeding, so that it fires sooner rather than later. */
++	if (likely(system_unbound_wq))
++		queue_delayed_work(system_unbound_wq, &next_reseed, crng_reseed_interval());
++
++	local_irq_save(flags);
++	enable_rnguard_iso_access();
++
++	rnguard_run_on_stack(_crng_reseed, ASM_CALL_ARG0, );
++
++	disable_rnguard_iso_access();
++	local_irq_restore(flags);
++}
++#elif defined(CONFIG_RNGUARD_MTE)
++
++/* This extracts a new crng key from the input pool. */
++static noinline void _crng_reseed(void)
++{
++	unsigned long flags;
++	unsigned long next_gen;
++	u8 key[CHACHA_KEY_SIZE];
++
++	rnguard_st_record_on_stack(rnguard_st_reseed_on_stack);
++
++	extract_entropy(key, sizeof(key));
++
++	/*
++	 * We copy the new key into the base_crng, overwriting the old one,
++	 * and update the generation counter. We avoid hitting ULONG_MAX,
++	 * because the per-cpu crngs are initialized to ULONG_MAX, so this
++	 * forces new CPUs that come online to always initialize.
++	 */
++	spin_lock_irqsave(&base_crng_p->lock, flags);
++	memcpy(base_crng_p->key, key, sizeof(base_crng_p->key));
++	next_gen = base_crng_p->generation + 1;
++	if (next_gen == ULONG_MAX)
++		++next_gen;
++	WRITE_ONCE(base_crng_p->generation, next_gen);
++#ifdef CONFIG_VDSO_GETRANDOM
++	/* base_crng.generation's invalid value is ULONG_MAX, while
++	 * _vdso_rng_data.generation's invalid value is 0, so add one to the
++	 * former to arrive at the latter. Use smp_store_release so that this
++	 * is ordered with the write above to base_crng.generation. Pairs with
++	 * the smp_rmb() before the syscall in the vDSO code.
++	 *
++	 * Cast to unsigned long for 32-bit architectures, since atomic 64-bit
++	 * operations are not supported on those architectures. This is safe
++	 * because base_crng.generation is a 32-bit value. On big-endian
++	 * architectures it will be stored in the upper 32 bits, but that's okay
++	 * because the vDSO side only checks whether the value changed, without
++	 * actually using or interpreting the value.
++	 */
++	smp_store_release((unsigned long *)&__arch_get_k_vdso_rng_data()->generation, next_gen + 1);
++#endif
++	if (!static_branch_likely(&crng_is_ready))
++		crng_init = CRNG_READY;
++	spin_unlock_irqrestore(&base_crng_p->lock, flags);
++
++	memzero_explicit(key, sizeof(key));
++}
++
++static void crng_reseed(struct work_struct *work)
++{
++	static DECLARE_DELAYED_WORK(next_reseed, crng_reseed);
++	unsigned long flags;
++
++	/* Immediately schedule the next reseeding, so that it fires sooner rather than later. */
++	if (likely(system_unbound_wq))
++		queue_delayed_work(system_unbound_wq, &next_reseed, crng_reseed_interval());
++
++	local_irq_save(flags);
++
++	rnguard_run_on_stack(_crng_reseed);
++
++	local_irq_restore(flags);
++}
++#else /* !CONFIG_RNGUARD_MPK && !CONFIG_RNGUARD_MTE */
+ /* This extracts a new crng key from the input pool. */
+ static void crng_reseed(struct work_struct *work)
+ {
+@@ -297,6 +488,7 @@ static void crng_reseed(struct work_struct *work)
+ 	spin_unlock_irqrestore(&base_crng.lock, flags);
+ 	memzero_explicit(key, sizeof(key));
+ }
++#endif /* CONFIG_RNGUARD_MPK || CONFIG_RNGUARD_MTE */
+ 
+ /*
+  * This generates a ChaCha block using the provided key, and then
+@@ -318,7 +510,9 @@ static void crng_fast_key_erasure(u8 key[CHACHA_KEY_SIZE],
+ {
+ 	u8 first_block[CHACHA_BLOCK_SIZE];
+ 
++#if !defined(CONFIG_RNGUARD_MPK) && !defined(CONFIG_RNGUARD_MTE)
+ 	BUG_ON(random_data_len > 32);
++#endif /* a BUG_ON inside a rnguard protected-stack window is unrecoverable */
+ 
+ 	chacha_init_consts(chacha_state);
+ 	memcpy(&chacha_state[4], key, CHACHA_KEY_SIZE);
+@@ -341,7 +535,9 @@ static void crng_make_state(u32 chacha_state[CHACHA_STATE_WORDS],
+ 	unsigned long flags;
+ 	struct crng *crng;
+ 
++#if !defined(CONFIG_RNGUARD_MPK) && !defined(CONFIG_RNGUARD_MTE)
+ 	BUG_ON(random_data_len > 32);
++#endif /* a BUG_ON inside a rnguard protected-stack window is unrecoverable */
+ 
+ 	/*
+ 	 * For the fast path, we check whether we're ready, unlocked first, and
+@@ -352,6 +548,17 @@ static void crng_make_state(u32 chacha_state[CHACHA_STATE_WORDS],
+ 	if (!crng_ready()) {
+ 		bool ready;
+ 
++#ifdef CONFIG_RNGUARD_MTE
++		spin_lock_irqsave(&base_crng_p->lock, flags);
++		ready = crng_ready();
++		if (!ready) {
++			if (crng_init == CRNG_EMPTY)
++				extract_entropy(base_crng_p->key, sizeof(base_crng_p->key));
++			crng_fast_key_erasure(base_crng_p->key, chacha_state,
++					      random_data, random_data_len);
++		}
++		spin_unlock_irqrestore(&base_crng_p->lock, flags);
++#else
+ 		spin_lock_irqsave(&base_crng.lock, flags);
+ 		ready = crng_ready();
+ 		if (!ready) {
+@@ -361,12 +568,17 @@ static void crng_make_state(u32 chacha_state[CHACHA_STATE_WORDS],
+ 					      random_data, random_data_len);
+ 		}
+ 		spin_unlock_irqrestore(&base_crng.lock, flags);
++#endif /* CONFIG_RNGUARD_MTE */
+ 		if (!ready)
+ 			return;
+ 	}
+ 
+ 	local_lock_irqsave(&crngs.lock, flags);
+ 	crng = raw_cpu_ptr(&crngs);
++#ifdef CONFIG_RNGUARD_MTE
++	if (crng_mte_ready())
++		crng = rnguard_tag_set(crng, RNGUARD_TAG);
++#endif
+ 
+ 	/*
+ 	 * If our per-cpu crng is older than the base_crng, then it means
+@@ -374,12 +586,21 @@ static void crng_make_state(u32 chacha_state[CHACHA_STATE_WORDS],
+ 	 * erasure on the base_crng, and use its output as the new key
+ 	 * for our per-cpu crng. This brings us up to date with base_crng.
+ 	 */
++#ifdef CONFIG_RNGUARD_MTE
++	if (unlikely(crng->generation != READ_ONCE(base_crng_p->generation))) {
++		spin_lock(&base_crng_p->lock);
++		crng_fast_key_erasure(base_crng_p->key, chacha_state,
++				      crng->key, sizeof(crng->key));
++		crng->generation = base_crng_p->generation;
++		spin_unlock(&base_crng_p->lock);
++#else /* !CONFIG_RNGUARD_MTE */
+ 	if (unlikely(crng->generation != READ_ONCE(base_crng.generation))) {
+ 		spin_lock(&base_crng.lock);
+ 		crng_fast_key_erasure(base_crng.key, chacha_state,
+ 				      crng->key, sizeof(crng->key));
+ 		crng->generation = base_crng.generation;
+ 		spin_unlock(&base_crng.lock);
++#endif /* CONFIG_RNGUARD_MTE */
+ 	}
+ 
+ 	/*
+@@ -393,6 +614,80 @@ static void crng_make_state(u32 chacha_state[CHACHA_STATE_WORDS],
+ 	local_unlock_irqrestore(&crngs.lock, flags);
+ }
+ 
++#if defined(CONFIG_RNGUARD_MPK) || defined(CONFIG_RNGUARD_MTE)
++/*
++ * The body both defenses run on their protected pseudo-stack. noinline is
++ * mandatory: inlined, the locals land back on the caller's ordinary stack.
++ */
++static noinline void __get_random_bytes(void *buf, size_t len)
++{
++	u32 chacha_state[CHACHA_STATE_WORDS];
++	u8 tmp[CHACHA_BLOCK_SIZE];
++	size_t first_block_len;
++
++	rnguard_st_record_on_stack(rnguard_st_grb_on_stack);
++
++	if (!len)
++		return;
++
++	first_block_len = min_t(size_t, 32, len);
++	crng_make_state(chacha_state, buf, first_block_len);
++	len -= first_block_len;
++	buf += first_block_len;
++
++	while (len) {
++		if (len < CHACHA_BLOCK_SIZE) {
++			chacha20_block(chacha_state, tmp);
++			memcpy(buf, tmp, len);
++			memzero_explicit(tmp, sizeof(tmp));
++			break;
++		}
++
++		chacha20_block(chacha_state, buf);
++		if (unlikely(chacha_state[12] == 0))
++			++chacha_state[13];
++		len -= CHACHA_BLOCK_SIZE;
++		buf += CHACHA_BLOCK_SIZE;
++	}
++
++	memzero_explicit(chacha_state, sizeof(chacha_state));
++}
++#endif /* CONFIG_RNGUARD_MPK || CONFIG_RNGUARD_MTE */
++
++#ifdef CONFIG_RNGUARD_MPK
++static void _get_random_bytes(void *buf, size_t len)
++{
++	unsigned long flags;
++
++	local_irq_save(flags);
++	enable_rnguard_iso_access();
++
++	rnguard_run_on_stack(__get_random_bytes, ASM_CALL_ARG2,
++										RNGUARD_2ARG_CONSTRAINTS(buf, len), buf, len);
++
++	disable_rnguard_iso_access();
++	local_irq_restore(flags);
++}
++
++#elif defined(CONFIG_RNGUARD_MTE)
++static void _get_random_bytes(void *buf, size_t len)
++{
++	unsigned long flags;
++
++	/*
++	 * XXX: the window is proportional to len and is uncapped; a
++	 * large get_random_bytes() therefore holds interrupts off for a
++	 * correspondingly long time. Cap this later...
++	 */
++	local_irq_save(flags);
++
++	rnguard_run_on_stack_args(__get_random_bytes, buf, len);
++
++	local_irq_restore(flags);
++}
++
++#else /* !CONFIG_RNGUARD_MPK && !CONFIG_RNGUARD_MTE */
++
+ static void _get_random_bytes(void *buf, size_t len)
+ {
+ 	u32 chacha_state[CHACHA_STATE_WORDS];
+@@ -424,6 +719,7 @@ static void _get_random_bytes(void *buf, size_t len)
+ 
+ 	memzero_explicit(chacha_state, sizeof(chacha_state));
+ }
++#endif /* CONFIG_RNGUARD_MPK || CONFIG_RNGUARD_MTE */
+ 
+ /*
+  * This returns random bytes in arbitrary quantities. The quality of the
+@@ -439,6 +735,48 @@ void get_random_bytes(void *buf, size_t len)
+ }
+ EXPORT_SYMBOL(get_random_bytes);
+ 
++#if defined(CONFIG_RNGUARD_MPK) || defined(CONFIG_RNGUARD_MTE)
++
++#define RNGUARD_USER_CHUNK_SIZE	512
++
++/*
++ * The upstream version keeps a live chacha_state across copy_to_iter() and
++ * cond_resched(), and neither the pkeys pseudo-stack nor the MTE per-CPU
++ * scratch may stay live across a fault or a reschedule. So each chunk is
++ * generated inside a protection window by _get_random_bytes(), and only the
++ * finished bytes cross the boundary.
++ *
++ * chunk[] is deliberately an ordinary stack array: it holds delivered
++ * randomness, which is out of scope in both designs (the caller's own buffer
++ * is unprotected the moment we return into it either way).
++ */
++static ssize_t get_random_bytes_user(struct iov_iter *iter)
++{
++	u8 chunk[RNGUARD_USER_CHUNK_SIZE];
++	size_t ret = 0, copied, len;
++
++	if (unlikely(!iov_iter_count(iter)))
++		return 0;
++
++	while (true) {
++		len = min_t(size_t, iov_iter_count(iter), sizeof(chunk));
++
++		_get_random_bytes(chunk, len);
++
++		copied = copy_to_iter(chunk, len, iter);
++		ret += copied;
++		if (!iov_iter_count(iter) || copied != len)
++			break;
++
++		if (signal_pending(current))
++			break;
++		cond_resched();
++	}
++
++	memzero_explicit(chunk, sizeof(chunk));
++	return ret ? ret : -EFAULT;
++}
++#else /* !CONFIG_RNGUARD_MPK && !CONFIG_RNGUARD_MTE */
+ static ssize_t get_random_bytes_user(struct iov_iter *iter)
+ {
+ 	u32 chacha_state[CHACHA_STATE_WORDS];
+@@ -487,6 +825,7 @@ out_zero_chacha:
+ 	memzero_explicit(chacha_state, sizeof(chacha_state));
+ 	return ret ? ret : -EFAULT;
+ }
++#endif /* CONFIG_RNGUARD_MPK || CONFIG_RNGUARD_MTE */
+ 
+ /*
+  * Batched entropy returns random integers. The quality of the random
+@@ -494,6 +833,7 @@ out_zero_chacha:
+  * provided by this function is okay, the function wait_for_random_bytes()
+  * should be called and return 0 at least once at any point prior.
+  */
++#if !(defined(CONFIG_RNGUARD_MPK) || defined(CONFIG_RNGUARD_MTE))
+ 
+ #define DEFINE_BATCHED_ENTROPY(type)						\
+ struct batch_ ##type {								\
+@@ -548,6 +888,155 @@ type get_random_ ##type(void)							\
+ }										\
+ EXPORT_SYMBOL(get_random_ ##type);
+ 
++#else /* CONFIG_RNGUARD_MPK || CONFIG_RNGUARD_MTE */
++#ifdef CONFIG_RNGUARD_MPK
++
++#define DEFINE_BATCHED_ENTROPY(type)						\
++struct batch_ ##type {								\
++	/*									\
++	 * We make this 1.5x a ChaCha block, so that we get the			\
++	 * remaining 32 bytes from fast key erasure, plus one full		\
++	 * block from the detached ChaCha state. We can increase		\
++	 * the size of this later if needed so long as we keep the		\
++	 * formula of (integer_blocks + 0.5) * CHACHA_BLOCK_SIZE.		\
++	 */									\
++	type entropy[CHACHA_BLOCK_SIZE * 3 / (2 * sizeof(type))];		\
++	local_lock_t lock;							\
++	unsigned long generation;						\
++	unsigned int position;							\
++};										\
++										\
++static DEFINE_PER_CPU_RNGUARD_ISO(struct batch_ ##type, batched_entropy_ ##type) = {	\
++	.lock = INIT_LOCAL_LOCK(batched_entropy_ ##type.lock),			\
++	.position = UINT_MAX							\
++};										\
++										\
++static noinline type _get_random_ ##type(void)							\
++{										\
++	type ret;								\
++	unsigned long flags;							\
++	struct batch_ ##type *batch;						\
++	unsigned long next_gen;							\
++										\
++	\
++	rnguard_st_record_on_stack(rnguard_st_gru_on_stack); \
++	\
++	if  (!crng_ready()) {							\
++		__get_random_bytes(&ret, sizeof(ret));				\
++		return ret;							\
++	}									\
++										\
++	local_lock_irqsave(&batched_entropy_ ##type.lock, flags);		\
++	batch = raw_cpu_ptr(&batched_entropy_##type);				\
++										\
++	next_gen = READ_ONCE(base_crng.generation);				\
++	if (batch->position >= ARRAY_SIZE(batch->entropy) ||			\
++	    next_gen != batch->generation) {					\
++		__get_random_bytes(batch->entropy, sizeof(batch->entropy));	\
++		batch->position = 0;						\
++		batch->generation = next_gen;					\
++	}									\
++										\
++	ret = batch->entropy[batch->position];					\
++	batch->entropy[batch->position] = 0;					\
++	++batch->position;							\
++	local_unlock_irqrestore(&batched_entropy_ ##type.lock, flags);		\
++	return ret;								\
++}										\
++\
++type get_random_ ##type(void)				\
++{	\
++	type ret;	\
++	unsigned long flags;	\
++	\
++	warn_unseeded_randomness();						\
++	\
++	local_irq_save(flags);	\
++	enable_rnguard_iso_access();	\
++	\
++	rnguard_run_on_stack_ret(ret, _get_random_ ##type, ASM_CALL_ARG0, );	\
++	\
++	disable_rnguard_iso_access();	\
++	local_irq_restore(flags);	\
++	return ret;	\
++}		\
++EXPORT_SYMBOL(get_random_ ##type);
++
++#else /* CONFIG_RNGUARD_MTE */
++
++#define DEFINE_BATCHED_ENTROPY(type)						\
++struct batch_ ##type {								\
++	/*									\
++	 * We make this 1.5x a ChaCha block, so that we get the			\
++	 * remaining 32 bytes from fast key erasure, plus one full		\
++	 * block from the detached ChaCha state. We can increase		\
++	 * the size of this later if needed so long as we keep the		\
++	 * formula of (integer_blocks + 0.5) * CHACHA_BLOCK_SIZE.		\
++	 */									\
++	type entropy[CHACHA_BLOCK_SIZE * 3 / (2 * sizeof(type))];		\
++	local_lock_t lock;							\
++	unsigned long generation;						\
++	unsigned int position;							\
++} __aligned(16);										\
++										\
++static DEFINE_PER_CPU(struct batch_ ##type, batched_entropy_ ##type) = {	\
++	.lock = INIT_LOCAL_LOCK(batched_entropy_ ##type.lock),			\
++	.position = UINT_MAX							\
++};										\
++										\
++static noinline type _get_random_ ##type(void)					\
++{										\
++	type ret;								\
++	unsigned long flags;							\
++	struct batch_ ##type *batch;						\
++	unsigned long next_gen;							\
++										\
++	rnguard_st_record_on_stack(rnguard_st_gru_on_stack);				\
++										\
++	if  (!crng_ready()) {							\
++		__get_random_bytes(&ret, sizeof(ret));				\
++		return ret;							\
++	}									\
++										\
++	local_lock_irqsave(&batched_entropy_ ##type.lock, flags);		\
++	batch = raw_cpu_ptr(&batched_entropy_##type);				\
++	if (crng_mte_ready())	\
++		batch = rnguard_tag_set(batch, RNGUARD_TAG); \
++										\
++	next_gen = READ_ONCE(base_crng_p->generation);				\
++	if (batch->position >= ARRAY_SIZE(batch->entropy) ||			\
++	    next_gen != batch->generation) {					\
++		__get_random_bytes(batch->entropy, sizeof(batch->entropy));	\
++		batch->position = 0;						\
++		batch->generation = next_gen;					\
++	}									\
++										\
++	ret = batch->entropy[batch->position];					\
++	batch->entropy[batch->position] = 0;					\
++	++batch->position;							\
++	local_unlock_irqrestore(&batched_entropy_ ##type.lock, flags);		\
++	return ret;								\
++}										\
++										\
++type get_random_ ##type(void)							\
++{										\
++	type ret;								\
++	unsigned long flags;							\
++										\
++	warn_unseeded_randomness();						\
++										\
++	local_irq_save(flags);							\
++										\
++	rnguard_run_on_stack_ret(ret, _get_random_ ##type);			\
++										\
++	local_irq_restore(flags);						\
++	return ret;								\
++}										\
++EXPORT_SYMBOL(get_random_ ##type);
++
++#endif /* CONFIG_RNGUARD_MTE */
++#endif /* CONFIG_RNGUARD_MPK || CONFIG_RNGUARD_MTE */
++
+ DEFINE_BATCHED_ENTROPY(u8)
+ DEFINE_BATCHED_ENTROPY(u16)
+ DEFINE_BATCHED_ENTROPY(u32)
+@@ -600,15 +1089,320 @@ int __cold random_prepare_cpu(unsigned int cpu)
+ 	 * the per-cpu crng and all batches, so that we serve fresh
+ 	 * randomness.
+ 	 */
++#ifdef CONFIG_RNGUARD_MTE
++	struct crng *crng = per_cpu_ptr(&crngs, cpu);
++	struct batch_u8 *batch_u8   = per_cpu_ptr(&batched_entropy_u8, cpu);
++	struct batch_u16 *batch_u16 = per_cpu_ptr(&batched_entropy_u16, cpu);
++	struct batch_u32 *batch_u32 = per_cpu_ptr(&batched_entropy_u32, cpu);
++	struct batch_u64 *batch_u64 = per_cpu_ptr(&batched_entropy_u64, cpu);
++	if (crng_mte_ready()) {
++		crng = rnguard_tag_set(crng, RNGUARD_TAG);
++		batch_u8  = rnguard_tag_set(batch_u8, RNGUARD_TAG);
++		batch_u16 = rnguard_tag_set(batch_u16, RNGUARD_TAG);
++		batch_u32 = rnguard_tag_set(batch_u32, RNGUARD_TAG);
++		batch_u64 = rnguard_tag_set(batch_u64, RNGUARD_TAG);
++	}
++	crng->generation = ULONG_MAX;
++	batch_u8->generation  = ULONG_MAX;
++	batch_u16->generation = ULONG_MAX;
++	batch_u32->generation = ULONG_MAX;
++	batch_u64->generation = ULONG_MAX;
++#else
++#ifdef CONFIG_RNGUARD_MPK
++	unsigned long flags;
++
++	local_irq_save(flags);
++	enable_rnguard_iso_access();
++#endif
+ 	per_cpu_ptr(&crngs, cpu)->generation = ULONG_MAX;
+ 	per_cpu_ptr(&batched_entropy_u8, cpu)->position = UINT_MAX;
+ 	per_cpu_ptr(&batched_entropy_u16, cpu)->position = UINT_MAX;
+ 	per_cpu_ptr(&batched_entropy_u32, cpu)->position = UINT_MAX;
+ 	per_cpu_ptr(&batched_entropy_u64, cpu)->position = UINT_MAX;
++#ifdef CONFIG_RNGUARD_MPK
++	disable_rnguard_iso_access();
++	local_irq_restore(flags);
++#endif
++#endif /* CONFIG_RNGUARD_MTE */
+ 	return 0;
+ }
+ #endif
+ 
++#ifdef CONFIG_RNGUARD_MTE
++//
++// XXX: this is temporary for now
++//
++static void __init rnguard_mte_init_base_crng(void)
++{
++	struct base_crng *new;
++	//unsigned long flags;
++	void *p;
++
++	new = (struct base_crng *)get_zeroed_page(GFP_KERNEL);
++	if (!new)
++		pr_err("  [!] Failed to allocate page for base_crng!\n");
++
++	spin_lock_init(&new->lock);
++
++	//spin_lock_irqsave(&base_crng.lock, flags);
++	//memcpy(new->key, base_crng.key, sizeof(new->key));
++	//new->generation = base_crng.generation;
++	//spin_unlock_irqrestore(&base_crng.lock, flags);
++	
++	/*
++	 * XXX: for now we just leave the other base_crng in memory. Eventually
++	 * re-work this some.
++	 */
++
++	/* Tag before publishing, so no reader can see an untagged pointer. */
++	p = new;
++	if (rnguard_set_mte_tags(&p, sizeof(*new)))
++		pr_err("  [!] Failed to tag base_crng!\n");
++
++	WRITE_ONCE(base_crng_p, p);
++}
++
++#ifdef CONFIG_RNGUARD_MTE_SELFTEST
++/*
++ * Verify a region's granules still carry RNGUARD_TAG. rnguard_selftest_region() runs
++ * right after each region is tagged, so it cannot see a later tagging on the
++ * same page undoing an earlier one. This runs after all of them and can.
++ */
++static void __init rnguard_st_recheck(const char *what, const void *tagged,
++				   size_t size)
++{
++	unsigned long addr;
++	unsigned int bad = 0;
++
++	for (addr = (unsigned long)tagged;
++	     addr < (unsigned long)tagged + size;
++	     addr += MTE_GRANULE_SIZE)
++		if (rnguard_mte_get_mem_tag((void *)addr) != RNGUARD_TAG)
++			bad++;
++
++	rnguard_selftest_check(!bad, what, "tags intact");
++	if (bad)
++		pr_err("  [!] %s: %u granule(s) at %px no longer tagged %u\n",
++		       what, bad, tagged, RNGUARD_TAG);
++}
++
++#define rnguard_st_recheck_pcpu(obj, type, cpu)				\
++do {									\
++	char __name[32];						\
++									\
++	scnprintf(__name, sizeof(__name), #obj " CPU#%d", (cpu));	\
++	rnguard_st_recheck(__name,						\
++			rnguard_tag_set(per_cpu_ptr(&(obj), (cpu)), RNGUARD_TAG), \
++			sizeof(type));					\
++} while (0)
++
++static void __init rnguard_st_recheck_all_tags(void)
++{
++	int cpu;
++
++	pr_info("Re-verifying every tagged region\n");
++
++	rnguard_st_recheck("base_crng", base_crng_p, sizeof(struct base_crng));
++
++	for_each_online_cpu(cpu) {
++		char name[32];
++
++		rnguard_st_recheck_pcpu(crngs, struct crng, cpu);
++		rnguard_st_recheck_pcpu(batched_entropy_u8, struct batch_u8, cpu);
++		rnguard_st_recheck_pcpu(batched_entropy_u16, struct batch_u16, cpu);
++		rnguard_st_recheck_pcpu(batched_entropy_u32, struct batch_u32, cpu);
++		rnguard_st_recheck_pcpu(batched_entropy_u64, struct batch_u64, cpu);
++
++		scnprintf(name, sizeof(name), "rnguard_stack CPU#%d", cpu);
++		rnguard_st_recheck(name,
++				rnguard_tag_set(per_cpu_ptr(&rnguard_stack, cpu)->stack,
++					     RNGUARD_TAG),
++				RNGUARD_STACK_SIZE);
++	}
++}
++#else /* !CONFIG_RNGUARD_MTE_SELFTEST */
++static inline void rnguard_st_recheck_all_tags(void) { }
++#endif /* CONFIG_RNGUARD_MTE_SELFTEST */
++
++static int __init rnguard_mte_init(void)
++{
++	int cpu;
++	struct crng *crng_p;
++	struct batch_u8 *batch_u8_p;
++	struct batch_u16 *batch_u16_p;
++	struct batch_u32 *batch_u32_p;
++	struct batch_u64 *batch_u64_p;
++
++	pr_info("[RNGUARD]: Initializing RNGUARD defense: MTE\n");
++
++	dump_mte_registers();
++	rnguard_selftest_preconditions();
++
++	/* Set the tags for the base_crng_p pointer and memory region */
++	rnguard_mte_init_base_crng();
++	rnguard_selftest_region("base_crng", base_crng_p, sizeof(struct base_crng));
++
++	/* Set the memory tags for each per-cpu struct crng and struct batch_u* */
++	for_each_online_cpu(cpu) {
++		char name[32];
++
++		crng_p = (struct crng *)per_cpu_ptr(&crngs, cpu);
++		rnguard_set_mte_tags((void **)&crng_p, sizeof(struct crng));
++
++		scnprintf(name, sizeof(name), "crngs CPU#%d", cpu);
++		rnguard_selftest_region(name, crng_p, sizeof(struct crng));
++
++		batch_u8_p  = (struct batch_u8 *)per_cpu_ptr(&batched_entropy_u8, cpu);
++		rnguard_set_mte_tags((void **)&batch_u8_p, sizeof(struct batch_u8));
++
++		scnprintf(name, sizeof(name), "batch_u8 CPU#%d", cpu);
++		rnguard_selftest_region(name, batch_u8_p, sizeof(struct batch_u8));
++
++		batch_u16_p = (struct batch_u16 *)per_cpu_ptr(&batched_entropy_u16, cpu);
++		rnguard_set_mte_tags((void **)&batch_u16_p, sizeof(struct batch_u16));
++
++		scnprintf(name, sizeof(name), "batch_u16 CPU#%d", cpu);
++		rnguard_selftest_region(name, batch_u16_p, sizeof(struct batch_u16));
++
++		batch_u32_p = (struct batch_u32 *)per_cpu_ptr(&batched_entropy_u32, cpu);
++		rnguard_set_mte_tags((void **)&batch_u32_p, sizeof(struct batch_u32));
++
++		scnprintf(name, sizeof(name), "batch_u32 CPU#%d", cpu);
++		rnguard_selftest_region(name, batch_u32_p, sizeof(struct batch_u32));
++
++		batch_u64_p = (struct batch_u64 *)per_cpu_ptr(&batched_entropy_u64, cpu);
++		rnguard_set_mte_tags((void **)&batch_u64_p, sizeof(struct batch_u64));
++
++		scnprintf(name, sizeof(name), "batch_u64 CPU#%d", cpu);
++		rnguard_selftest_region(name, batch_u64_p, sizeof(struct batch_u64));
++
++	}
++
++	/*
++	 * Transient state. Unlike the objects above these are never reached
++	 * through a stored tagged pointer: rnguard_stack_top() re-derives the tag
++	 * on every entry, so only the memory needs tagging.
++	 */
++	if (rnguard_mte_init_stacks())
++		pr_err("  [!] Pseudo-stack setup incomplete\n");
++	rnguard_selftest_stack();
++
++	rnguard_st_recheck_all_tags();
++
++	rnguard_selftest_summary();
++
++	crng_mte_set_ready();
++
++	return 0;
++}
++pure_initcall(rnguard_mte_init);
++
++#ifdef CONFIG_RNGUARD_MTE_SELFTEST
++/*
++ * Opt-in and fatal by design. Writes isolated state through an untagged
++ * pointer, as an arbitrary-write primitive would; the panic from
++ * do_tag_recovery() is the pass condition.
++ */
++static bool rnguard_st_test_violation __initdata;
++
++static int __init rnguard_st_setup_test_violation(char *str)
++{
++	rnguard_st_test_violation = true;
++	return 1;
++}
++__setup("rnguard_test_violation", rnguard_st_setup_test_violation);
++
++static void __init rnguard_st_provoke_violation(void)
++{
++	unsigned long *p;
++
++	if (!rnguard_st_test_violation)
++		return;
++
++	/*
++	 * Unlike the probes in rnguard_mte.c this store has no exception table
++	 * entry, so fixup_exception() does not swallow the fault first.
++	 */
++	p = (unsigned long *)__untagged_addr((u64)base_crng_p);
++	pr_alert("[RNGUARD]: writing isolated state via untagged %px\n", p);
++	WRITE_ONCE(*p, 0);
++
++	pr_err("  [!] FAIL: isolation violation was not trapped\n");
++}
++
++/*
++ * Exercise every switch boundary, then assert each body really ran on the
++ * pseudo-stack. Recording happens on the live paths, so a switch that stopped
++ * happening - say the body got inlined back into its wrapper - fails here.
++ */
++static int __init rnguard_selftest_rng(void)
++{
++	u8 big[CHACHA_BLOCK_SIZE * 2 + 8];
++	u64 a = 0, b = 0;
++
++	/*
++	 * Clear first, or a stale 'true' from early boot would let a switch
++	 * that has since stopped happening still pass. Not
++	 * rnguard_st_credit_on_stack, whose site cannot be triggered from here.
++	 */
++	WRITE_ONCE(rnguard_st_grb_on_stack, false);
++	WRITE_ONCE(rnguard_st_gru_on_stack, false);
++	WRITE_ONCE(rnguard_st_reseed_on_stack, false);
++
++	get_random_bytes(&a, sizeof(a));
++	get_random_bytes(&b, sizeof(b));
++	pr_info("[RNGUARD]: get_random_bytes selftest: %s\n",
++			(a && b && a != b) ? "PASS" : "FAIL");
++
++	/*
++	 * Longer than one ChaCha block and not a multiple of it, so both the
++	 * full-block and the short-tail arms of the _get_random_bytes() loop
++	 * run and tmp[] is touched.
++	 */
++	get_random_bytes(big, sizeof(big));
++	memzero_explicit(big, sizeof(big));
++
++	/* Batched path, and then the reseed path incl. extract_entropy(). */
++	(void)get_random_u32();
++	(void)get_random_u64();
++	crng_reseed(NULL);
++
++	pr_info("Verifying RNG transient state ran on the pseudo-stack\n");
++	rnguard_selftest_check(rnguard_st_grb_on_stack, "_get_random_bytes",
++			    "body ran on the pseudo-stack");
++	rnguard_selftest_check(rnguard_st_gru_on_stack, "get_random_uXX",
++			    "body ran on the pseudo-stack");
++	rnguard_selftest_check(rnguard_st_reseed_on_stack, "crng_reseed",
++			    "body ran on the pseudo-stack");
++
++	/*
++	 * The early-seed path only runs if crng_init was still CRNG_EMPTY when
++	 * the pool crossed POOL_EARLY_BITS, so "never reached" is a legitimate
++	 * outcome and must not be reported as a failure.
++	 */
++	if (rnguard_st_credit_on_stack < 0)
++		pr_info("[RNGUARD]: _credit_init_bits early-seed path not reached this boot\n");
++	else
++		rnguard_selftest_check(rnguard_st_credit_on_stack == 1,
++				    "_credit_init_bits early seed",
++				    "body ran on the pseudo-stack");
++
++	/* Everything above still passes if tag checking has been turned off. */
++	rnguard_selftest_tcf();
++
++	/* And the tags themselves, now that the system has been running. */
++	rnguard_st_recheck_all_tags();
++
++	rnguard_selftest_summary();
++
++	rnguard_st_provoke_violation();
++
++	return 0;
++}
++late_initcall(rnguard_selftest_rng);
++#endif /* CONFIG_RNGUARD_MTE_SELFTEST */
++#endif /* CONFIG_RNGUARD_MTE */
++
+ 
+ /**********************************************************************
+  *
+@@ -721,11 +1515,38 @@ static void extract_entropy(void *buf, size_t len)
+ 
+ #define credit_init_bits(bits) if (!crng_ready()) _credit_init_bits(bits)
+ 
++#ifdef CONFIG_RNGUARD_MTE
++/*
++ * The early-seed path runs extract_entropy() too, so it wants the same
++ * pseudo-stack treatment as crng_reseed(). Split out to give the switch a
++ * noinline body to land in.
++ */
++static noinline void __cold _credit_init_early_seed(void)
++{
++	unsigned long flags;
++
++	rnguard_st_record_on_stack(rnguard_st_credit_on_stack);
++
++	spin_lock_irqsave(&base_crng_p->lock, flags);
++	/* Check if crng_init is CRNG_EMPTY, to avoid race with crng_reseed(). */
++	if (crng_init == CRNG_EMPTY) {
++		extract_entropy(base_crng_p->key, sizeof(base_crng_p->key));
++		crng_init = CRNG_EARLY;
++	}
++	spin_unlock_irqrestore(&base_crng_p->lock, flags);
++}
++#endif /* CONFIG_RNGUARD_MTE */
++
+ static void __cold _credit_init_bits(size_t bits)
+ {
+ 	static DECLARE_WORK(set_ready, crng_set_ready);
+ 	unsigned int new, orig, add;
++#ifndef CONFIG_RNGUARD_MTE
+ 	unsigned long flags;
++#endif
++#if defined(CONFIG_RNGUARD_MPK) || defined(CONFIG_RNGUARD_MTE)
++	unsigned long irqflags;
++#endif
+ 
+ 	if (!bits)
+ 		return;
+@@ -752,6 +1573,17 @@ static void __cold _credit_init_bits(size_t bits)
+ 			pr_notice("%d urandom warning(s) missed due to ratelimiting\n",
+ 				  urandom_warning.missed);
+ 	} else if (orig < POOL_EARLY_BITS && new >= POOL_EARLY_BITS) {
++#ifdef CONFIG_RNGUARD_MTE
++		local_irq_save(irqflags);
++
++		rnguard_run_on_stack(_credit_init_early_seed);
++
++		local_irq_restore(irqflags);
++#else /* !CONFIG_RNGUARD_MTE */
++#ifdef CONFIG_RNGUARD_MPK
++		local_irq_save(irqflags);
++		enable_rnguard_iso_access();
++#endif
+ 		spin_lock_irqsave(&base_crng.lock, flags);
+ 		/* Check if crng_init is CRNG_EMPTY, to avoid race with crng_reseed(). */
+ 		if (crng_init == CRNG_EMPTY) {
+@@ -759,6 +1591,11 @@ static void __cold _credit_init_bits(size_t bits)
+ 			crng_init = CRNG_EARLY;
+ 		}
+ 		spin_unlock_irqrestore(&base_crng.lock, flags);
++#ifdef CONFIG_RNGUARD_MPK
++		disable_rnguard_iso_access();
++		local_irq_restore(irqflags);
++#endif
++#endif /* CONFIG_RNGUARD_MTE */
+ 	}
+ }
+ 
+diff --git a/include/asm-generic/vmlinux.lds.h b/include/asm-generic/vmlinux.lds.h
+index fa284b6..27e2eea 100644
+--- a/include/asm-generic/vmlinux.lds.h
++++ b/include/asm-generic/vmlinux.lds.h
+@@ -1032,6 +1032,7 @@
+  * @cacheline is used to align subsections to avoid false cacheline
+  * sharing between subsections for different purposes.
+  */
++#ifndef CONFIG_RNGUARD_MPK
+ #define PERCPU_INPUT(cacheline)						\
+ 	__per_cpu_start = .;						\
+ 	*(.data..percpu..first)						\
+@@ -1044,6 +1045,25 @@
+ 	*(.data..percpu..shared_aligned)				\
+ 	PERCPU_DECRYPTED_SECTION					\
+ 	__per_cpu_end = .;
++#else
++#define PERCPU_INPUT(cacheline)						\
++	__per_cpu_start = .;						\
++	*(.data..percpu..first)						\
++	. = ALIGN(PAGE_SIZE);						\
++	*(.data..percpu..page_aligned)					\
++	. = ALIGN(cacheline);						\
++	*(.data..percpu..read_mostly)					\
++	. = ALIGN(cacheline);						\
++	*(.data..percpu)						\
++	*(.data..percpu..shared_aligned)				\
++	PERCPU_DECRYPTED_SECTION					\
++	. = ALIGN(PAGE_SIZE);						\
++	__percpu_rnguard_iso_start = .;		\
++	*(.data..percpu..rnguard_iso)				\
++	. = ALIGN(PAGE_SIZE);						\
++	__percpu_rnguard_iso_end = .;		\
++	__per_cpu_end = .;
++#endif /* CONFIG_RNGUARD_MPK */
+ 
+ /**
+  * PERCPU_VADDR - define output section for percpu area
+diff --git a/include/linux/percpu-defs.h b/include/linux/percpu-defs.h
+index 8efce74..a60635e 100644
+--- a/include/linux/percpu-defs.h
++++ b/include/linux/percpu-defs.h
+@@ -162,6 +162,19 @@
+ 	DEFINE_PER_CPU_SECTION(type, name, "..page_aligned")		\
+ 	__aligned(PAGE_SIZE)
+ 
++#ifdef CONFIG_RNGUARD_MPK
++/*
++ * Declaration/definition used for per-CPU variables and placed in the
++ * isolated ..rnguard_iso section. Page alignment is added specifically at
++ * definition sites (if needed).
++ */
++#define DECLARE_PER_CPU_RNGUARD_ISO(type, name)			\
++	DECLARE_PER_CPU_SECTION(type, name, "..rnguard_iso")
++
++#define DEFINE_PER_CPU_RNGUARD_ISO(type, name)				\
++	DEFINE_PER_CPU_SECTION(type, name, "..rnguard_iso")
++#endif /* CONFIG_RNGUARD_MPK */
++
+ /*
+  * Declaration/definition used for per-CPU variables that must be read mostly.
+  */
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index 3f9c238..a4a2f7d 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -1,6 +1,42 @@
+ # SPDX-License-Identifier: GPL-2.0-only
+ menu "Kernel hacking"
+ 
++config RNGUARD_MPK
++    bool "Enable memory protection key defense for RNGUARD"
++		depends on X86_INTEL_MEMORY_PROTECTION_KEYS
++		depends on MITIGATION_PAGE_TABLE_ISOLATION
++    help
++      Selecting this option provides integrity and confidentiality
++			for the kernel RNG using PKEYS. This feature hacks PKU to make
++			it available in the kernel and uses this isolation primitive
++			to secure various sensitive data in the kernel RNG which is
++			extracted into separate pages.
++
++config RNGUARD_MPK_SELFTEST
++	bool "Run boot-time self-tests for the RNGUARD pkeys defense"
++	depends on RNGUARD_MPK
++	help
++		Run a set of boot-time tests that verify the isolated .rnguard_iso
++		region behaves as intended. Results are reported via dmesg.
++
++		This is for debugging. Say N for production builds.
++
++config RNGUARD_MTE
++	bool "Enable MTE defense for RNGUARD"
++	depends on ARM64_MTE
++	help
++		Selecting this option provides integrity and confidentiality
++		for the kernel RNG using MTE for ARM64.
++
++config RNGUARD_MTE_SELFTEST
++	bool "Run boot-time self-tests for the RNGUARD MTE defense"
++	depends on RNGUARD_MTE
++	help
++		Run a set of boot-time tests that verify the isolated MTE
++		regions behave as intended. Results are reported via dmesg.
++
++		This is for debugging. Say N for production builds.
++
+ menu "printk and dmesg options"
+ 
+ config PRINTK_TIME

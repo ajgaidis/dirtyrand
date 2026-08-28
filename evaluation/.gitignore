@@ -1,0 +1,12 @@
+# Unpacked by lmbench/prepare-lmbench.sh from the bundled tarball.
+lmbench/lmbench-3.0-a9/
+
+# Written by lmbench/prepare-lmbench.sh; describes THIS machine's libtirpc.
+lmbench/rpc-env.sh
+
+# Written by run-pts.sh. The tag must survive the reboot between the two halves
+# of a sweep, but it is per-machine state rather than artifact content --
+# results/pts/SWEEP-TAG is the committed record of which sweep we shipped.
+harness/.sweep-tag
+
+__pycache__/

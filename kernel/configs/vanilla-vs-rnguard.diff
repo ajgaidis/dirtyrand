@@ -1,0 +1,21 @@
+--- kernel/configs/x86_64-vanilla.config
++++ kernel/configs/x86_64-rnguard.config
+@@ -31,7 +31,7 @@
+ # CONFIG_COMPILE_TEST is not set
+ # CONFIG_WERROR is not set
+ # CONFIG_UAPI_HEADER_TEST is not set
+-CONFIG_LOCALVERSION="-rnguard-vanilla"
++CONFIG_LOCALVERSION="-rnguard-mpk"
+ # CONFIG_LOCALVERSION_AUTO is not set
+ CONFIG_BUILD_SALT=""
+ CONFIG_HAVE_KERNEL_GZIP=y
+@@ -10672,7 +10672,8 @@
+ #
+ # Kernel hacking
+ #
+-# CONFIG_RNGUARD_MPK is not set
++CONFIG_RNGUARD_MPK=y
++# CONFIG_RNGUARD_MPK_SELFTEST is not set
+ 
+ #
+ # printk and dmesg options

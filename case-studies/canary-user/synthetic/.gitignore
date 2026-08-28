@@ -1,0 +1,4 @@
+# Build products (see the clean: rule in Makefile).
+canary-poc
+read_canary
+.cache/

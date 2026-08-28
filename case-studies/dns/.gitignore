@@ -1,0 +1,3 @@
+# Build products (see the clean: rule in Makefile).
+dns-query-kmod
+dns-poison

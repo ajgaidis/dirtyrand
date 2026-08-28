@@ -1,0 +1,15 @@
+kprobe:tty_insert_flip_string_and_push_buffer,
+/comm != "bpftrace"/
+{
+	$port = (struct tty_port *)arg0;
+	// printf("%p, %s\n", $port, comm);
+	@events[nsecs] = ($port, comm);
+	// printf("%s\n", kstack());
+}
+
+interval:s:5 {
+	printf("*** Map dump start ***\n");
+	print(@events);
+	// print("hello\n");
+	printf("*** Map dump end ***\n");
+}

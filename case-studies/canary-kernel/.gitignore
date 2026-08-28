@@ -1,0 +1,24 @@
+# Userspace binaries (built by make)
+exploit_escalation
+exploit_rop
+extract_canary_trigger
+extract_child
+canary_restore_payload
+
+# Auto-generated header (find_gadgets.sh / Makefile)
+gadgets.h
+
+# Kernel module build artifacts (kbuild)
+*.ko
+*.o
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+.*.cmd
+modules.order
+Module.symvers
+.tmp_versions/
+
+# Also produced by the exploit targets.
+canary_reverse_engineer

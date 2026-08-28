@@ -1,0 +1,13 @@
+--- a/redis
++++ b/redis
+@@ -1,8 +1,10 @@
+ #!/bin/sh
+ cd ~/redis-8.6.0
+ 
++# save "" disables RDB snapshots -- see redis-1.5.1/redis for the full note.
+ echo "io-threads 8
+ io-threads-do-reads yes
++save \"\"
+ tcp-keepalive 0" > redis.conf
+ 
+ ./src/redis-server redis.conf &

@@ -1,0 +1,1044 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous Submission #60 <anon@example.invalid>
+Date: Fri, 28 Aug 2026 12:56:41 -0400
+Subject: [PATCH] RNGuard: x86-64 backend using memory protection keys
+
+Implements the RNGuard gate on x86-64 with Intel MPK. Pages in the
+.rnguard_iso section are mapped user-accessible (U/S=1) and assigned
+protection key 1, so an ordinary kernel access is refused twice over: by
+SMAP because the page is user-accessible, and by PKRU because the key
+denies access. enable_rnguard_iso_access() opens both for the duration of a
+gate window; disable_rnguard_iso_access() closes them again. The pair is
+refcounted so nesting is safe.
+
+The protected per-CPU pseudo-stack is a page-aligned object in the same
+section, with an unmapped guard page placed first so a downward overflow
+faults instead of corrupting the neighbouring crngs and batched_entropy
+pools. Installing the guard page must happen after the section's 4K split,
+or lookup_address() returns a PMD and clearing _PAGE_PRESENT would unmap
+2 MiB of the direct map; the PG_LEVEL_4K check enforces that ordering.
+
+The stack switch reuses upstream's call_on_stack(), which is already
+objtool-annotated and stores the caller's RSP at the top of the new stack.
+The unwinder is taught about the new stack type so a backtrace taken while
+the RNG is running on it terminates cleanly rather than walking off into
+unrelated memory. Stack bounds are computed arithmetically from the static
+per-CPU base, never by dereferencing protected memory, so the unwinder
+stays safe to call with the gate closed and from noinstr context.
+
+Note that an exception taken while the stack pointer is on the pseudo-stack
+is unrecoverable: exception entry re-arms SMAP and then keeps pushing onto
+the protected stack. No WARN, BUG_ON or other trap-capable code may appear
+below a switch point.
+---
+ arch/x86/include/asm/rnguard_mpk.h | 152 +++++++
+ arch/x86/include/asm/stacktrace.h  |   3 +
+ arch/x86/kernel/dumpstack_64.c     |  46 ++
+ arch/x86/kernel/vmlinux.lds.S      |  15 +
+ arch/x86/mm/Makefile               |   1 +
+ arch/x86/mm/rnguard_mpk.c          | 707 +++++++++++++++++++++++++++++
+ 6 files changed, 924 insertions(+)
+ create mode 100644 arch/x86/include/asm/rnguard_mpk.h
+ create mode 100644 arch/x86/mm/rnguard_mpk.c
+
+diff --git a/arch/x86/include/asm/rnguard_mpk.h b/arch/x86/include/asm/rnguard_mpk.h
+new file mode 100644
+index 0000000..4db50f1
+--- /dev/null
++++ b/arch/x86/include/asm/rnguard_mpk.h
+@@ -0,0 +1,152 @@
++#ifndef _ASM_X86_RNGUARD_MPK_H
++#define _ASM_X86_RNGUARD_MPK_H
++
++#include <linux/compiler_attributes.h>
++#include <linux/percpu-defs.h>
++#include <linux/preempt.h>
++#include <asm/asm.h>
++#include <asm/irq_stack.h>
++#include <asm/pgtable_types.h>
++#include <asm/pkru.h>
++#include <asm/uaccess.h>
++
++/* The global pkey value that we use for isolated .rnguard_iso pages */
++#define PKEY_VAL	1U
++
++/* Macros that translate the pkey value into PTE entries */
++#define PKEY_PTE(pkey)	(((pkey) & 0xfUL) << _PAGE_BIT_PKEY_BIT0)
++#define _PAGE_ISO_PKEY	(PKEY_PTE(PKEY_VAL))
++
++/* Masks for setting/clearing PKRU */
++#define PKRU_MASK(pkey)	\
++	(u32)((PKRU_AD_BIT | PKRU_WD_BIT) << (PKRU_BITS_PER_PKEY * (pkey)))
++
++#ifdef CONFIG_RNGUARD_MPK
++
++#define RNGUARD_STACK_SIZE		PAGE_SIZE
++
++struct rnguard_stack {
++	u8 guard[PAGE_SIZE];
++	u8 stack[RNGUARD_STACK_SIZE];
++} __aligned(PAGE_SIZE);
++DECLARE_PER_CPU_RNGUARD_ISO(struct rnguard_stack, rnguard_stack);
++
++static __always_inline bool on_rnguard_stack(void)
++{
++	unsigned long sp = current_stack_pointer;
++	unsigned long lo = (unsigned long)raw_cpu_ptr(&rnguard_stack)->stack;
++
++	return sp >= lo && sp < lo + RNGUARD_STACK_SIZE;
++}
++
++#ifdef CONFIG_RNGUARD_MPK_SELFTEST
++#define rnguard_st_record_on_stack(var)  WRITE_ONCE((var), on_rnguard_stack())
++#else
++#define rnguard_st_record_on_stack(var)  do { } while (0)
++#endif
++
++/* Variable used for the stack unwinder to read pointer with gate closed */
++DECLARE_PER_CPU(unsigned long, rnguard_stack_caller_sp);
++
++/*
++ * Same as call_on_stack(), but captures the callee's return value from RAX.
++ */
++#define rnguard_call_on_stack_ret(ret, stack, func, asm_call, argconstr...)      \
++{																																							\
++	register void *tos asm("r11");																							\
++																																							\
++  tos = ((void *)(stack));																										\
++																																							\
++	asm_inline volatile(																												\
++		"movq   %%rsp, (%[tos])                         \n"												\
++    "movq   %[tos], %%rsp                           \n"             					\
++                                                                    					\
++    asm_call                                                        					\
++                                                                    					\
++    "popq   %%rsp                                   \n"             					\
++																																							\
++    : "+r" (tos), "=a" (ret), ASM_CALL_CONSTRAINT															\
++    : [__func] "i" (func), [tos] "r" (tos) argconstr													\
++		: "cc", "rcx", "rdx", "rsi", "rdi", "r8", "r9", "r10",  "memory"					\
++	);																																					\
++}
++
++/*
++ * Switch RSP to this CPU's isolated pseudo-stack for the duration of func.
++ * Note that the isolation gate must already be open and interrupts must
++ * be disabled!
++ */
++#define rnguard_run_on_stack(func, asm_call, constr, c_args...)				\
++{																																		\
++	if (on_rnguard_stack()) {																						\
++		func(c_args);																										\
++	} else {																													\
++		__this_cpu_write(rnguard_stack_caller_sp, current_stack_pointer);	\
++		call_on_stack((unsigned long)this_cpu_ptr(&rnguard_stack)->stack		\
++									+ RNGUARD_STACK_SIZE - 8, func, asm_call, constr);		\
++	}																																	\
++}
++
++#define rnguard_run_on_stack_ret(ret, func, asm_call, constr, c_args...)				\
++{																																						\
++	if (on_rnguard_stack()) {																										\
++		ret = func(c_args);																											\
++	} else {																																	\
++		__this_cpu_write(rnguard_stack_caller_sp, current_stack_pointer);					\
++		rnguard_call_on_stack_ret(ret,																							\
++													 (unsigned long)this_cpu_ptr(&rnguard_stack)->stack	\
++														+ RNGUARD_STACK_SIZE - 8, func, asm_call, constr);	\
++	}																																					\
++}
++
++#define RNGUARD_1ARG_CONSTRAINTS(a)					\
++      , [arg1] "r" ((unsigned long)(a))
++#define RNGUARD_2ARG_CONSTRAINTS(a, b)				\
++      , [arg1] "r" ((unsigned long)(a)),	\
++        [arg2] "r" ((unsigned long)(b))
++#define RNGUARD_3ARG_CONSTRAINTS(a, b, c)		\
++      , [arg1] "r" ((unsigned long)(a)),	\
++        [arg2] "r" ((unsigned long)(b)),	\
++        [arg3] "r" ((unsigned long)(c))
++
++#endif /* CONFIG_RNGUARD_MPK */
++
++#ifdef CONFIG_RNGUARD_MPK_SELFTEST
++extern bool rnguard_st_grb_on_stack;
++extern bool rnguard_st_gru_on_stack;
++#endif
++
++/*
++ * Open/close the pkey gate. NOT nesting safe by design. Every caller must
++ * hold interrupts off across the whole window, and no window may be entered
++ * from inside another on the same CPU.
++ */
++static __always_inline inline void enable_rnguard_iso_access(void)
++{
++	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
++		return;
++
++#ifdef CONFIG_RNGUARD_MPK_SELFTEST
++	WARN_ONCE(!(read_pkru() & PKRU_MASK(PKEY_VAL)),
++			"RNGUARD: gate already open on entry (nesting?)\n");
++#endif
++
++	wrpkru(rdpkru() & ~PKRU_MASK(PKEY_VAL));
++	__uaccess_begin();
++}
++
++static __always_inline void disable_rnguard_iso_access(void)
++{
++	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
++		return;
++
++#ifdef CONFIG_RNGUARD_MPK_SELFTEST
++	WARN_ONCE(read_pkru() & PKRU_MASK(PKEY_VAL),
++			"RNGUARD: gate already closed on eexit (unbalanced?)\n");
++#endif
++
++	wrpkru(rdpkru() | PKRU_MASK(PKEY_VAL));
++	__uaccess_end();
++}
++
++#endif /*_ASM_X86_RNGUARD_MPK_H */
+diff --git a/arch/x86/include/asm/stacktrace.h b/arch/x86/include/asm/stacktrace.h
+index 3881b53..c31e279 100644
+--- a/arch/x86/include/asm/stacktrace.h
++++ b/arch/x86/include/asm/stacktrace.h
+@@ -21,6 +21,9 @@ enum stack_type {
+ 	STACK_TYPE_ENTRY,
+ 	STACK_TYPE_EXCEPTION,
+ 	STACK_TYPE_EXCEPTION_LAST = STACK_TYPE_EXCEPTION + N_EXCEPTION_STACKS-1,
++#ifdef CONFIG_RNGUARD_MPK
++	STACK_TYPE_RNGUARD
++#endif
+ };
+ 
+ struct stack_info {
+diff --git a/arch/x86/kernel/dumpstack_64.c b/arch/x86/kernel/dumpstack_64.c
+index f05339f..3ac956c 100644
+--- a/arch/x86/kernel/dumpstack_64.c
++++ b/arch/x86/kernel/dumpstack_64.c
+@@ -19,6 +19,10 @@
+ #include <asm/cpu_entry_area.h>
+ #include <asm/stacktrace.h>
+ 
++#ifdef CONFIG_RNGUARD_MPK
++#include <asm/rnguard_mpk.h>
++#endif
++
+ static const char * const exception_stack_names[] = {
+ 		[ ESTACK_DF	]	= "#DF",
+ 		[ ESTACK_NMI	]	= "NMI",
+@@ -53,6 +57,11 @@ const char *stack_type_name(enum stack_type type)
+ 	if (type >= STACK_TYPE_EXCEPTION && type <= STACK_TYPE_EXCEPTION_LAST)
+ 		return exception_stack_names[type - STACK_TYPE_EXCEPTION];
+ 
++#ifdef CONFIG_RNGUARD_MPK
++	if (type == STACK_TYPE_RNGUARD)
++		return "RNGUARD";
++#endif
++
+ 	return NULL;
+ }
+ 
+@@ -132,6 +141,38 @@ static __always_inline bool in_exception_stack(unsigned long *stack, struct stac
+ 	return true;
+ }
+ 
++#ifdef CONFIG_RNGUARD_MPK
++static __always_inline bool in_rnguard_stack(unsigned long *stack, struct stack_info *info)
++{
++	unsigned long *begin, *end;
++
++	begin = (unsigned long *)raw_cpu_ptr(&rnguard_stack)->stack;
++	end   = begin + RNGUARD_STACK_SIZE / sizeof(long);
++
++	if (stack < begin || stack >= end)
++		return false;
++
++	info->type = STACK_TYPE_RNGUARD;
++
++	/* Report an empty range to avoid #PFs */
++	info->begin = stack;
++	info->end   = stack;
++
++	/*
++	 * Saved RSP lives at the top of the pseudo-stack, which is protected, so
++	 * use the unprotected mirror.
++	 */
++	info->next_sp = (unsigned long *)raw_cpu_read(rnguard_stack_caller_sp);
++
++	return true;
++}
++#else /* !CONFIG_RNGUARD_MPK */
++static __always_inline bool in_rnguard_stack(unsigned long *stack, struct stack_info *info)
++{
++	return false;
++}
++#endif /* CONFIG_RNGUARD_MPK */
++
+ static __always_inline bool in_irq_stack(unsigned long *stack, struct stack_info *info)
+ {
+ 	unsigned long *end = (unsigned long *)this_cpu_read(pcpu_hot.hardirq_stack_ptr);
+@@ -179,6 +220,11 @@ bool noinstr get_stack_info_noinstr(unsigned long *stack, struct task_struct *ta
+ 	if (in_exception_stack(stack, info))
+ 		return true;
+ 
++#ifdef CONFIG_RNGUARD_MPK
++	if (in_rnguard_stack(stack, info))
++		return true;
++#endif
++
+ 	if (in_irq_stack(stack, info))
+ 		return true;
+ 
+diff --git a/arch/x86/kernel/vmlinux.lds.S b/arch/x86/kernel/vmlinux.lds.S
+index feb8102..1921c19 100644
+--- a/arch/x86/kernel/vmlinux.lds.S
++++ b/arch/x86/kernel/vmlinux.lds.S
+@@ -189,6 +189,21 @@ SECTIONS
+ 		_edata = .;
+ 	} :data
+ 
++
++#ifdef CONFIG_RNGUARD_MPK
++		/*
++		 * New section for isolated pages for RNGUARD pkeys defense.
++	   * Put it in the data segment.
++	   */ 
++		. = ALIGN(PAGE_SIZE);
++		.rnguard_iso : AT(ADDR(.rnguard_iso) - LOAD_OFFSET) {
++			__rnguard_iso_start = .;
++			*(.rnguard_iso)
++			. = ALIGN(PAGE_SIZE);
++			__rnguard_iso_end = .;
++		} :data
++#endif /* CONFIG_RNGUARD_MPK */
++
+ 	BUG_TABLE
+ 
+ 	ORC_UNWIND_TABLE
+diff --git a/arch/x86/mm/Makefile b/arch/x86/mm/Makefile
+index 690fbf4..d442d4e 100644
+--- a/arch/x86/mm/Makefile
++++ b/arch/x86/mm/Makefile
+@@ -61,6 +61,7 @@ obj-$(CONFIG_ACPI_NUMA)		+= srat.o
+ obj-$(CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS)	+= pkeys.o
+ obj-$(CONFIG_RANDOMIZE_MEMORY)			+= kaslr.o
+ obj-$(CONFIG_MITIGATION_PAGE_TABLE_ISOLATION)	+= pti.o
++obj-$(CONFIG_RNGUARD_MPK)		+= rnguard_mpk.o
+ 
+ obj-$(CONFIG_X86_MEM_ENCRYPT)	+= mem_encrypt.o
+ obj-$(CONFIG_AMD_MEM_ENCRYPT)	+= mem_encrypt_amd.o
+diff --git a/arch/x86/mm/rnguard_mpk.c b/arch/x86/mm/rnguard_mpk.c
+new file mode 100644
+index 0000000..8206e95
+--- /dev/null
++++ b/arch/x86/mm/rnguard_mpk.c
+@@ -0,0 +1,707 @@
++#define pr_fmt(fmt) "[RNGUARD]: " fmt
++
++#include <linux/compiler_attributes.h>
++#include <linux/cpumask.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/percpu-defs.h>
++#include <linux/pgtable.h>
++#include <asm/cpufeature.h>
++#include <asm/pgtable.h>
++#include <asm/page.h>
++#include <asm/tlbflush.h>
++#include <asm/set_memory.h>
++#include <asm/rnguard_mpk.h>
++#include <asm-generic/cacheflush.h>
++
++DEFINE_PER_CPU_RNGUARD_ISO(int, rnguard_refcount);
++DEFINE_PER_CPU_RNGUARD_ISO(struct rnguard_stack, rnguard_stack) __aligned(PAGE_SIZE);
++DEFINE_PER_CPU(unsigned long, rnguard_stack_caller_sp);
++
++/* Linker script symbols that define the start/end of the isolation regions. */
++extern char __rnguard_iso_start[];
++extern char __rnguard_iso_end[];
++extern char __percpu_rnguard_iso_start[];
++extern char __percpu_rnguard_iso_end[];
++
++static const char *pg_level_str_arr[7] = {
++	"PG_LEVEL_NONE",
++	"PG_LEVEL_4K",
++	"PG_LEVEL_2M",
++	"PG_LEVEL_1G",
++	"PG_LEVEL_512G",
++	"PG_LEVEL_256T",
++	"PG_LEVEL_NUM"
++};
++#define pg_level_str(level)		(pg_level_str_arr[(level)])
++
++bool has_rnguard_mpk_support = false;
++
++static void setup_pte_for_addr(unsigned long addr)
++{
++	pgd_t *pgdp, pgd;
++	p4d_t *p4dp, p4d;
++	pud_t *pudp, pud;
++	pmd_t *pmdp, pmd;
++	pte_t *ptep, pte;
++
++	pr_info("Setting U/S in page table hierarchy for address: 0x%lx\n", addr);
++
++	/* Get the Page Global Directory for the address */
++	pgdp = pgd_offset_k(addr);
++	if (pgd_none(*pgdp)) {
++		pr_err("[!] PGD entry refers to unmapped memory!\n");
++		return;
++	}
++
++	/* Set the PGD to a new one with U/S = 1 if not done already */
++	if (!(pgd_flags(*pgdp) & _PAGE_USER)) {
++		pgd = __pgd(pgd_val(*pgdp) | _PAGE_USER);
++		set_pgd(pgdp, pgd);
++	}
++
++	/* Get the P4D entry for the address */
++	p4dp = p4d_offset(pgdp, addr);
++	if (p4d_none(*p4dp)) {
++		pr_err("[!] P4D entry refers to unmapped memory!\n");
++		return;
++	}
++	if (p4d_leaf(*p4dp)) {
++		pr_err("[!] P4D is a leaf! Prior splitting failed!\n");
++		return;
++	}
++
++	/* Set the P4D to a new one with U/S = 1 if not done already */
++	if (!(p4d_flags(*p4dp) & _PAGE_USER)) {
++		p4d = __p4d(p4d_val(*p4dp) | _PAGE_USER);
++		set_p4d(p4dp, p4d);
++	}
++
++	/* Get the PUD entry for the address */
++	pudp = pud_offset(p4dp, addr);
++	if (pud_none(*pudp)) {
++		pr_err("[!] PUD entry refers to unmapped memory!\n");
++		return;
++	}
++	if (pud_leaf(*pudp)) {
++		pr_err("[!] PUD is a leaf! Prior splitting failed!\n");
++		return;
++	}
++
++	/* Set the PUD to a new one with U/S = 1 if not done already */
++	if (!(pud_flags(*pudp) & _PAGE_USER)) {
++		pud = pud_set_flags(*pudp, _PAGE_USER);
++		set_pud(pudp, pud);
++	}
++
++	/* Get the PMD entry for the address */
++	pmdp = pmd_offset(pudp, addr);
++	if (pmd_none(*pmdp)) {
++		pr_err("[!] PMD entry refers to unmapped memory!\n");
++		return;
++	}
++	if (pmd_leaf(*pmdp)) {
++		pr_err("[!] PMD is a leaf! Prior splitting failed!\n");
++		return;
++	}
++
++	/* Set the PMD to a new one with U/S = 1 if not done already. */
++	if (!(pmd_flags(*pmdp) & _PAGE_USER)) {
++		pmd = pmd_set_flags(*pmdp, _PAGE_USER);
++		set_pmd(pmdp, pmd);
++	}
++
++	/* Get the PTE entry for the address */
++	ptep = pte_offset_kernel(pmdp, addr);
++	if (pte_none(*ptep)) {
++		pr_err("[!] PTE entry refers to unmapped memory!\n");
++		return;
++	}
++
++	/* Modify the PTE by setting _PAGE_USER and the pkey value for the PTE. */
++	pte = pte_clear_flags(*ptep, _PAGE_PKEY_MASK);
++	pte = pte_set_flags(pte, _PAGE_USER | _PAGE_ISO_PKEY);
++	set_pte(ptep, pte);
++}
++
++static void setup_rnguard_iso_pages(unsigned long start_addr,
++		unsigned long end_addr)
++{
++	unsigned long addr;
++	unsigned int level;
++	int ret;
++	pte_t *ptep;
++
++	pr_info("Making .rnguard_iso [0x%lx - 0x%lx] user pages.\n",
++			start_addr, end_addr);
++
++	/* Iterate through each page in the section */
++	for (addr = start_addr; addr < end_addr; addr += PAGE_SIZE) {
++		/*
++		 * First, lookup the PTE for this kernel address. At this point, we are
++		 * specifically interested in the level that is returned, as this will
++		 * tell us if huge pages are being used, preventing 4KB page permissions.
++		 */
++		ptep = lookup_address(addr, &level);
++		if (!ptep) {
++			pr_err("  [!] PTE missing for address: 0x%lx\n", addr);
++			return;
++		}
++
++		/*
++		 * If we didn't get a 4K PTE, we need to split the memory. This should
++		 * work to split all higher memory until we have a 4KB page. This means
++		 * that if there is, for example, a leaf PUD that refers to 1GB pages,
++		 * this should split into a PMD structure and a 4KB PTE structure as
++		 * follows:
++		 *
++		 *	Pre-split state:
++		 *		PUD entry -> 1GB page
++		 *
++		 *	Split #1:
++		 *		PUD entry -> PMD table (4K page, 512 2MB PMD entries)
++		 *
++		 *	Split #2 (kernel identified which PMD corresponds to addr):
++		 *		PMD entry -> PTE table (4K page, 512 4KB PTE entries
++		 *
++		 *	Post-split state:
++		 *		PUD entry -> PMD table
++		 *		PMD entry -> PTE table
++		 *		PTE entry -> 4KB page
++		 */
++		if (level != PG_LEVEL_4K) {
++			pr_warn("  [!] PTE pointer level = %s!\n", pg_level_str(level));
++			pr_warn("  [!] Splitting memory to make a 4KB PTE!\n");
++			ret = set_memory_4k(addr, (end_addr - start_addr) / PAGE_SIZE);
++			if (ret) {
++				pr_err("  [!] Failed to split memory! Aborting everything...\n");
++				return;
++			}
++			pr_info("  [+] Split memory successfully!\n");
++		} 
++
++		/*
++		 * Set all U/S bits in the page table hierarchy corresponding to addr to 1.
++		 * This marks the kernel pages as user-space, making them inaccessible
++		 * while SMAP is active.
++		 *
++		 * Also, set a pkey value on each of the isolated pages' PTEs.
++		 */
++		setup_pte_for_addr(addr);
++	}
++
++	/* Flush the TLB to remove any cached flags etc. */
++	flush_tlb_kernel_range(start_addr, end_addr);
++
++	pr_info(".rnguard_iso section is now user accessible (U/S=1).\n");
++}
++
++static inline bool is_pte_user_page(pte_t pte)
++{
++	return (pte_val(pte) & _PAGE_PRESENT) && (pte_val(pte) & _PAGE_USER);
++}
++
++static void __init rnguard_install_guard_page(unsigned long addr)
++{
++	unsigned int level;
++	pte_t *ptep;
++
++	ptep = lookup_address(addr, &level);
++	if (!ptep) {
++		pr_err("  [!] No PTE for guard page 0x%lx\n", addr);
++		return;
++	}
++	if (level != PG_LEVEL_4K) {
++		pr_err("  [!] Guard page 0x%lx has level %s, expected 4K\n",
++						addr, pg_level_str(level));
++		return;
++	}
++
++	/* Unmap the page: any overflow off the bottom of the stack now #PFs */
++	set_pte(ptep, pte_clear_flags(*ptep, _PAGE_PRESENT));
++	flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
++
++	pr_info("  [+] Guard page installed at 0x%lx\n", addr);
++}
++
++#ifdef CONFIG_RNGUARD_MPK_SELFTEST
++
++bool rnguard_st_grb_on_stack;
++bool rnguard_st_gru_on_stack;
++
++static unsigned int __initdata rnguard_st_total;
++static unsigned int __initdata rnguard_st_pass;
++static unsigned int __initdata rnguard_st_fail;
++
++#define RNGUARD_ST(cond, fmt, ...)												\
++do {																									\
++	rnguard_st_total++;																		\
++	if (cond) {																					\
++		rnguard_st_pass++;																		\
++		pr_info("  [+] PASS: " fmt "\n", ##__VA_ARGS__);	\
++	} else {																						\
++		rnguard_st_fail++;																		\
++		pr_err("  [!] FAIL: " fmt "\n", ##__VA_ARGS__);		\
++	}																										\
++} while (0)
++
++#define RNGUARD_ST_GATED(probe, fmt, ...)	\
++do {																		\
++	bool __cond;													\
++	unsigned long __flags;                \
++	local_irq_save(__flags);              \
++	enable_rnguard_iso_access();							\
++	__cond = (probe);											\
++	disable_rnguard_iso_access();						\
++	local_irq_restore(__flags);           \
++	RNGUARD_ST(__cond, fmt, ##__VA_ARGS__);	\
++} while(0)
++
++struct rnguard_page_audit {
++	unsigned int pages;
++  unsigned int unmapped;  /* hole somewhere in the walk */
++  unsigned int not_4k;    /* leaf above PTE -- splitting failed */
++  unsigned int not_user;  /* U/S = 0 at some level */
++  unsigned int bad_pkey;  /* PTE pkey != PKEY_VAL */
++};
++
++static bool __init rnguard_is_guard_page(unsigned long addr)
++{
++	int cpu;
++
++	for_each_online_cpu(cpu)
++		if (addr == (unsigned long)per_cpu_ptr(&rnguard_stack, cpu)->guard)
++			return true;
++
++	return false;
++}
++
++static void __init rnguard_audit_page(unsigned long addr, struct rnguard_page_audit *a)
++{
++	unsigned int level;
++	pgd_t *pgdp;
++	p4d_t *p4dp;
++	pud_t *pudp;
++	pmd_t *pmdp;
++	pte_t *ptep;
++	bool user = true;
++
++	/* Guard pages are deliberately not present; audited separately. */
++	if (rnguard_is_guard_page(addr))
++		return;
++
++	a->pages++;
++
++	ptep = lookup_address(addr, &level);
++	if (!ptep) {
++		a->unmapped++;
++		pr_warn("  [!] 0x%lx: no PTE\n", addr);
++		return;
++	}
++	if (level != PG_LEVEL_4K) {
++		a->not_4k++;
++		pr_warn("  [!] 0x%lx: mapped at %s, expected 4K\n",
++				addr, pg_level_str(level));
++	}
++
++	pgdp = pgd_offset_k(addr);
++	if (pgd_none(*pgdp))
++		goto unmapped;
++	if (!(pgd_flags(*pgdp) & _PAGE_USER)) {
++		user = false;
++		pr_warn("  [!] 0x%lx: PGD has U/S = 0\n", addr);
++	}
++
++	p4dp = p4d_offset(pgdp, addr);
++	if (p4d_none(*p4dp) || p4d_leaf(*p4dp))
++		goto unmapped;
++	if (!(p4d_flags(*p4dp) & _PAGE_USER)) {
++		user = false;
++		pr_warn("  [!] 0x%lx: P4D has U/S = 0\n", addr);
++	}
++
++	pudp = pud_offset(p4dp, addr);
++	if (pud_none(*pudp) || pud_leaf(*pudp))
++		goto unmapped;
++	if (!(pud_flags(*pudp) & _PAGE_USER)) {
++		user = false;
++		pr_warn("  [!] 0x%lx: PUD has U/S = 0\n", addr);
++	}
++
++	pmdp = pmd_offset(pudp, addr);
++	if (pmd_none(*pmdp) || pmd_leaf(*pmdp))
++		goto unmapped;
++	if (!(pmd_flags(*pmdp) & _PAGE_USER)) {
++		user = false;
++		pr_warn("  [!] 0x%lx: PMD has U/S = 0\n", addr);
++	}
++
++	ptep = pte_offset_kernel(pmdp, addr);
++	if (pte_none(*ptep))
++		goto unmapped;
++	if (!(pte_flags(*ptep) & _PAGE_USER)) {
++		user = false;
++		pr_warn("  [!] 0x%lx: PTE has U/S = 0\n", addr);
++	}
++
++	if (!user)
++		a->not_user++;
++
++	if ((pte_flags(*ptep) & _PAGE_PKEY_MASK) != _PAGE_ISO_PKEY) {
++		a->bad_pkey++;
++		pr_warn("  [!] 0x%lx: PTE pkey is not %u\n", addr, PKEY_VAL);
++	}
++
++	return;
++
++unmapped:
++	a->unmapped++;
++	pr_warn("  [!] 0x%lx: hole or unexpected leaf in the walk\n", addr);
++}
++
++static void __init rnguard_audit_region(const char *what, unsigned long start,
++                                   unsigned long end)
++{
++	struct rnguard_page_audit a = {};
++	unsigned long addr;
++
++	for (addr = start; addr < end; addr += PAGE_SIZE)
++		rnguard_audit_page(addr, &a);
++
++	pr_info("  [i] %s [0x%lx - 0x%lx): %u page(s) audited\n",
++			what, start, end, a.pages);
++
++	RNGUARD_ST(a.pages > 0, "%s: region is non-empty", what);
++	RNGUARD_ST(!a.unmapped, "%s: all pages mapped (%u bad)", what, a.unmapped);
++	RNGUARD_ST(!a.not_4k,   "%s: all pages 4K-mapped (%u bad)", what, a.not_4k);
++	RNGUARD_ST(!a.not_user, "%s: U/S=1 through full walk (%u bad)", what, a.not_user);
++	RNGUARD_ST(!a.bad_pkey, "%s: PTE pkey == %u (%u bad)", what, PKEY_VAL, a.bad_pkey);
++}
++
++static void __init rnguard_selftest_pages(void)
++{
++	char name[32];
++	int cpu;
++
++	pr_info("Running RNGUARD pkeys page-table self-tests!\n");
++
++	rnguard_audit_region("global .rnguard_iso",
++			(unsigned long)__rnguard_iso_start,
++			(unsigned long)__rnguard_iso_end);
++
++	for_each_online_cpu(cpu) {
++		scnprintf(name, sizeof(name), "percpu CPU#%d", cpu);
++		rnguard_audit_region(name,
++				(unsigned long)per_cpu_ptr(__percpu_rnguard_iso_start, cpu),
++				(unsigned long)per_cpu_ptr(__percpu_rnguard_iso_end, cpu));
++	}
++
++	for_each_online_cpu(cpu) {
++		unsigned long addr = (unsigned long)per_cpu_ptr(&rnguard_stack, cpu)->guard;
++		unsigned int level;
++		pte_t *ptep;
++
++		ptep = lookup_address(addr, &level);
++		RNGUARD_ST(ptep && level == PG_LEVEL_4K &&
++				!(pte_flags(*ptep) & _PAGE_PRESENT),
++				"CPU#%d: guard page 0x%lx is not present", cpu, addr);
++	}
++}
++
++/*
++ * Probe helpers. These emit an exception-table entry for the faulting
++ * instruction, so a fault returns false instead of oopsing.
++ *
++ * They must be __always_inline: they are called between __uaccess_begin()
++ * and __uaccess_end(), and objtool's uaccess validation warns about any
++ * out-of-line call made with UACCESS enabled. This is also why we cannot
++ * just use copy_to_kernel_nofault().
++ */
++static __always_inline bool rnguard_probe_write(void *addr, u64 val)
++{
++      __put_kernel_nofault(addr, &val, u64, fault);
++      return true;
++fault:
++      return false;
++}
++
++static __always_inline bool rnguard_probe_read(const void *addr, u64 *out)
++{
++      __get_kernel_nofault(out, addr, u64, fault);
++      return true;
++fault:
++      return false;
++}
++
++static unsigned long __initdata rnguard_st_inner_sp;
++static unsigned long __initdata rnguard_st_nested_sp;
++
++/*
++ * noinline is a must for these functions as getting inlined kills makes them
++ * use the caller's stack and makes the test pointless.
++ */
++static noinline void __init rnguard_st_2(void)
++{
++	rnguard_st_nested_sp = current_stack_pointer;
++}
++
++static noinline void __init rnguard_st_1(void)
++{
++	rnguard_st_inner_sp = current_stack_pointer;
++	rnguard_run_on_stack(rnguard_st_2, ASM_CALL_ARG0, );
++}
++
++static void __init rnguard_selftest(void)
++{
++	int cpu;
++
++	pr_info("Running RNGUARD pkeys self-tests!\n");
++
++	for_each_online_cpu(cpu) {
++		u64 readback = 0;
++		unsigned long lo, hi;
++		struct rnguard_stack *ks;
++
++		ks = per_cpu_ptr(&rnguard_stack, cpu);
++		lo = (unsigned long)per_cpu_ptr(__percpu_rnguard_iso_start, cpu);
++		hi = (unsigned long)per_cpu_ptr(__percpu_rnguard_iso_end, cpu);
++
++		/*
++		 * ST#1: Check placement of rnguard_stack.
++		 */
++		RNGUARD_ST((unsigned long)ks >= lo && (unsigned long)ks + sizeof(*ks) <= hi,
++						"CPU#%d: rnguard_stack inside percpu iso section", cpu);
++		RNGUARD_ST(IS_ALIGNED((unsigned long)ks, PAGE_SIZE),
++						"CPU#%d: rnguard_stack is page aligned", cpu);
++
++		/*
++		 * ST#2: Ensure that while the gateway is closed, access must be denied.
++		 */
++		RNGUARD_ST(!rnguard_probe_write(&ks->stack[0], 0xdeadbeef),
++						"CPU#%d: stack write denied with gate closed", cpu);
++		RNGUARD_ST(!rnguard_probe_read(&ks->stack[0], &readback),
++						"CPU#%d: stack read denied with gate closed", cpu);
++
++		/*
++		 * ST#3: Ensure reading/writing with gate open is allowed.
++		 */
++		RNGUARD_ST_GATED(rnguard_probe_write(&ks->stack[RNGUARD_STACK_SIZE - 8], 0x0ddba115),
++									"CPU#%d: wrote top of stack with gate open", cpu);
++		RNGUARD_ST_GATED(rnguard_probe_read(&ks->stack[RNGUARD_STACK_SIZE - 8], &readback) &&
++									readback == 0x0ddba115,
++									"CPU#%d: read top of stack with gate open", cpu);
++		RNGUARD_ST_GATED(rnguard_probe_write(&ks->stack[0], 0xdeadbeef),
++									"CPU#%d: wrote bottom of stack with gate open", cpu);
++		RNGUARD_ST_GATED(rnguard_probe_read(&ks->stack[0], &readback) &&
++									readback == 0xdeadbeef,
++									"CPU#%d: read top of stack with gate open", cpu);
++
++		/*
++		 * ST#4: Ensure guard page faults even with fate open.
++		 */
++		RNGUARD_ST_GATED(!rnguard_probe_write(&ks->guard[PAGE_SIZE - 8], 0xdead),
++									"CPU#%d: guard page correctly faults with gate open", cpu);
++	}
++
++	/*
++	 * ST#5: Ensure stack switching works. rnguard_run_on_stack() uses
++	 * this_cpu_ptr() so we can't test arbitrary CPUs. This can be changed in
++	 * rnguard_run_on_stack() but IDK if there is a reason to right now.
++	 */
++	{
++		struct rnguard_stack *ks = this_cpu_ptr(&rnguard_stack);
++		unsigned long lo = (unsigned long)ks->stack;
++		unsigned long hi = lo + RNGUARD_STACK_SIZE;
++
++		unsigned long sp_before, sp_after, caller_sp;
++		unsigned long flags;
++
++		local_irq_save(flags);
++		enable_rnguard_iso_access();
++
++		sp_before = current_stack_pointer;
++		rnguard_run_on_stack(rnguard_st_1, ASM_CALL_ARG0, );
++		sp_after = current_stack_pointer;
++
++		caller_sp = __this_cpu_read(rnguard_stack_caller_sp);
++
++		disable_rnguard_iso_access();
++		local_irq_restore(flags);
++
++		RNGUARD_ST(rnguard_st_inner_sp >= lo && rnguard_st_inner_sp < hi,
++            "CPU#%d: switched onto pseudo-stack (sp 0x%lx)",
++						smp_processor_id(), rnguard_st_inner_sp);
++
++		RNGUARD_ST(rnguard_st_nested_sp >= lo && rnguard_st_nested_sp < hi &&
++						rnguard_st_nested_sp < rnguard_st_inner_sp,
++						"CPU#%d: nested call stayed on pseudo-stack (sp 0x%lx)",
++						smp_processor_id(), rnguard_st_nested_sp);
++
++		RNGUARD_ST(sp_after == sp_before,
++						"CPU#%d: RSP restored after switch",
++						smp_processor_id());
++
++		RNGUARD_ST(caller_sp < lo || caller_sp >= hi,
++						"CPU#%d: caller_sp points off the pseudo-stack (0x%lx)",
++						smp_processor_id(), caller_sp);
++	}
++
++	/*
++	 * ST#6: Ensure physmap aliases of the global iso section are gone.
++	 */
++	{
++		unsigned long alias = (unsigned long)__va(__pa_symbol(__rnguard_iso_start));
++		unsigned int level;
++		pte_t *ptep = lookup_address(alias, &level);
++		u64 scratch;
++
++		RNGUARD_ST(ptep && !(pte_flags(*ptep) & _PAGE_PRESENT),
++				"physmap alias 0x%lx of .rnguard_iso is not present", alias);
++		RNGUARD_ST(!rnguard_probe_write((void *)alias, 0xdeadbeef),
++				"write to physmap alias 0x%lx faults", alias);
++		RNGUARD_ST(!rnguard_probe_read((const void *)alias, &scratch),
++				"read from physmap alias 0x%lx faults", alias);
++		RNGUARD_ST_GATED(!rnguard_probe_write((void *)alias, 0xdeadbeef),
++				"physmap alias faults even with gate open");
++	}
++}
++
++static int __init rnguard_selftest_rng(void)
++{
++	u64 a = 0;
++	u64 b = 0;
++	u32 a32 = 0;
++	u32 b32 = 0;
++
++	rnguard_st_grb_on_stack = false;
++	get_random_bytes(&a, sizeof(a));
++
++	RNGUARD_ST(rnguard_st_grb_on_stack, "get_random_bytes ran on the protected stack");
++
++	get_random_bytes(&b, sizeof(b));
++	RNGUARD_ST(a != b, "get_random_bytes returns differing values");
++	RNGUARD_ST(a != 0 && b != 0, "get_random_bytes returns nonzero");
++
++	rnguard_st_gru_on_stack = false;
++	a32 = get_random_u32();
++	RNGUARD_ST(rnguard_st_gru_on_stack, "get_random_u32 ran on the protected stack");
++
++	b32 = get_random_u32();
++	RNGUARD_ST(a32 != b32, "get_random_u32 returns differing values");
++
++	return 0;
++}
++late_initcall(rnguard_selftest_rng);
++
++static int __init rnguard_selftest_summary(void)
++{
++	if (!rnguard_st_total) {
++		pr_warn("RNGUARD self-tests: none ran\n");
++		return 0;
++	}
++
++	if (rnguard_st_fail)
++		pr_err("RNGUARD self-tests: %u PASSED, %u FAILED (%u TOTAL)\n",
++						rnguard_st_pass, rnguard_st_fail, rnguard_st_total);
++	else
++		pr_info("RNGUARD self-tests: all %u PASSED!\n", rnguard_st_pass);
++
++	return 0;
++}
++late_initcall_sync(rnguard_selftest_summary);
++#endif /* CONFIG_RNGUARD_MPK_SELFTEST */
++
++static void __init rnguard_unmap_physmap_alias(unsigned long start_addr,
++																						unsigned long end_addr)
++{
++	unsigned long npages = (end_addr - start_addr) >> PAGE_SHIFT;
++	unsigned long alias = (unsigned long)__va(__pa_symbol(start_addr));
++	unsigned int level;
++	pte_t *ptep;
++	int ret;
++
++	pr_info("Unmapping physmap alias [0x%lx - 0x%lx] of .rnguard_iso\n",
++					alias, alias + (npages << PAGE_SHIFT));
++
++	ptep = lookup_address(alias, &level);
++	if (!ptep || !(pte_flags(*ptep) & _PAGE_PRESENT)) {
++		pr_err("  [!] No present physmap alias at 0x%lx\n", alias);
++		return;
++	}
++
++	ret = set_memory_np_noalias(alias, npages);
++	if (ret) {
++		pr_err("  [!] Failed to unmap physmap alias (%d)\n", ret);
++		return;
++	}
++
++	pr_info("  [+] Physmap alias unmapped!\n");
++}
++
++static int __init rnguard_mpk_init(void)
++{
++	unsigned long start_addr, end_addr;
++	int cpu;
++
++	pr_info("Initializing RNGUARD defense: pkeys\n");
++
++	if (!cpu_feature_enabled(X86_FEATURE_PKU)) {
++		pr_warn("  [-] PKU is NOT enabled/supported.\n");
++	} else if (!cpu_feature_enabled(X86_FEATURE_SMAP)) {
++		pr_warn("  [-] SMAP is NOT enabled/supported.\n");
++	} else if (!cpu_feature_enabled(X86_FEATURE_PTI)) {
++		pr_warn("  [-] PTI is NOT enabled/supported.\n");
++	} else {
++		pr_info("  [+] PKU, SMAP, PTI are supported and active.\n");
++		has_rnguard_mpk_support = true;
++	}
++
++	if (!has_rnguard_mpk_support) {
++		pr_err("RNGUARD defense (pkeys) missing feature! Isolation disabled.\n");
++		return -ENODEV;
++	}
++
++	/*
++	 * Make pages in all .rnguard_iso sections user pages (U/S = 1) and verify.
++	 */
++
++	/* Start with .rnguard_iso section */
++	start_addr = (unsigned long)__rnguard_iso_start;
++	end_addr   = (unsigned long)__rnguard_iso_end;
++	setup_rnguard_iso_pages(start_addr, end_addr);
++	rnguard_unmap_physmap_alias(start_addr, end_addr);
++
++	/* Now do .data..percpu..rnguard_iso section for each CPU */
++	for_each_online_cpu(cpu) {
++		pr_info("Setting up isolated area for CPU#%d\n", cpu);
++		start_addr = (unsigned long)per_cpu_ptr(__percpu_rnguard_iso_start, cpu);
++		end_addr   = (unsigned long)per_cpu_ptr(__percpu_rnguard_iso_end, cpu);
++
++		/* Ensure percpu data is only in physmap memory */
++		if (!virt_addr_valid((void *)start_addr)) {
++			pr_err("  [!] CPU#%d percpu iso area 0x%lx is not physmapped\n",
++						cpu, start_addr);
++			has_rnguard_mpk_support = false;
++			return -EINVAL;
++		}
++
++		setup_rnguard_iso_pages(start_addr, end_addr);
++	}
++
++	for_each_online_cpu(cpu) {
++		struct rnguard_stack *ks = per_cpu_ptr(&rnguard_stack, cpu);
++		pr_info("CPU#%d rnguard_stack: guard 0x%lx stack [0x%lx - 0x%lx)\n",
++						cpu, (unsigned long)ks->guard, (unsigned long)ks->stack,
++						(unsigned long)ks->stack + RNGUARD_STACK_SIZE);
++		rnguard_install_guard_page((unsigned long)ks->guard);
++	}
++
++#ifdef CONFIG_RNGUARD_MPK_SELFTEST
++	rnguard_selftest_pages();
++	rnguard_selftest();
++#endif /* CONFIG_RNGUARD_MPK_SELFTEST */
++
++  return 0;
++}
++pure_initcall(rnguard_mpk_init);

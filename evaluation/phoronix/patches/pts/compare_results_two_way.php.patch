@@ -1,0 +1,32 @@
+--- a/compare_results_two_way.php
++++ b/compare_results_two_way.php
+@@ -104,6 +104,20 @@
+ 		usort($wins, array('compare_results_two_way', 'sort_two_way_data_desc'));
+ 		usort($losses, array('compare_results_two_way', 'sort_two_way_data_desc'));
+ 
++		// PATCH(rnguard): $longest_identifier was only ever updated as a side
++		// effect of the usort() comparators above, but PHP does not invoke a
++		// comparator for arrays of fewer than 2 elements. With a small result
++		// set the width stayed 0, so the str_repeat() below was handed a
++		// negative count and threw:
++		//   ValueError: str_repeat(): Argument #2 ($times) must be >= 0
++		// Compute the width explicitly over the rows we are about to print.
++		foreach(array_merge($wins, $losses) as $rd)
++		{
++			self::$longest_identifier = max(self::$longest_identifier,
++				strlen($rd[0]->test_profile->get_title()),
++				strlen($rd[0]->get_arguments_description()));
++		}
++
+ 		// , $second_run . pts_client::cli_colored_text(' Draws', 'gray', true) => $too_close
+ 		echo pts_client::cli_just_bold($second_run . ' vs. ' . $first_run . ' Baseline') . PHP_EOL . PHP_EOL;
+ 		foreach(array(pts_client::cli_colored_text($second_run . ' Wins', 'green', true) => $wins, pts_client::cli_colored_text($second_run . ' Losses', 'red', 'true') => $losses) as $group => $data)
+@@ -111,7 +125,7 @@
+ 			echo $group . PHP_EOL;
+ 			foreach($data as $result_data)
+ 			{
+-				echo pts_client::cli_just_bold($result_data[0]->test_profile->get_title()) . str_repeat(' ', self::$longest_identifier - strlen($result_data[0]->test_profile->get_title())) . ' ' . $result_data[1] . 'x' . PHP_EOL;
++				echo pts_client::cli_just_bold($result_data[0]->test_profile->get_title()) . str_repeat(' ', max(0, self::$longest_identifier - strlen($result_data[0]->test_profile->get_title()))) . ' ' . $result_data[1] . 'x' . PHP_EOL;
+ 
+ 				if($result_data[0]->get_arguments_description() != null)
+ 				{

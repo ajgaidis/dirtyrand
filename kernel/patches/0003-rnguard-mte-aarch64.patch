@@ -1,0 +1,1151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous Submission #60 <anon@example.invalid>
+Date: Fri, 28 Aug 2026 12:57:29 -0400
+Subject: [PATCH] RNGuard: AArch64 backend using memory tagging
+
+Implements the RNGuard gate on AArch64 with MTE. Where the x86-64 backend
+is permission-based -- the pages are simply inaccessible until the gate
+opens -- MTE is match-based: the protected memory is given allocation tag
+RNGUARD_TAG, and only a pointer carrying that tag can access it. An attacker
+with an arbitrary write reaches the RNG's state through an ordinary,
+untagged kernel pointer, and the mismatch raises a synchronous tag-check
+fault.
+
+Four pieces of arm64 configuration have to be corrected first, because in a
+stock kernel none of this checks anything:
+
+  - TCR_EL1.TCMA1 exempts tag-0xF pointers -- every ordinary kernel pointer
+    -- from checking. It is set only under CONFIG_KASAN_HW_TAGS, so
+    enabling KASAN_HW_TAGS silently voids this defense even though every
+    register dump and ldg readback still looks correct.
+  - SCTLR_EL1.TCF is likewise set only from KASAN's mte_enable_kernel_sync().
+    mte_cpu_setup() now sets it directly, which covers the boot CPU,
+    secondaries, hotplug and resume in one place.
+  - kasan_init_hw_tags_cpu() returns early when KASAN is off, before the
+    above would run; it now proceeds when RNGuard is enabled.
+  - map_mem() maps the entire linear map MT_NORMAL_TAGGED. With TCMA1
+    cleared and TCF on, every ordinary kernel access would be checked
+    against tag-0 granules and panic. The linear map is therefore mapped
+    plain PAGE_KERNEL and only the pages RNGuard actually protects are
+    promoted. This costs userspace PROT_MTE, which is a deliberate
+    trade-off for the research kernel and is noted in the artifact docs.
+
+An EL1 tag-check fault now fails closed. Upstream's handler disables tag
+checking on the faulting CPU and retries, which would let a single stray
+write switch the defense off and then succeed -- silently, since
+report_tag_fault() is an empty stub without KASAN_HW_TAGS. RNGuard panics
+instead. Exception fixups run first, so the *_kernel_nofault() probes used
+by the self-tests are unaffected.
+
+Transient state is handled as on x86-64, by pivoting sp onto a per-CPU
+tagged pseudo-stack (rnguard-stack.S) for the duration of each window, with
+a guard page below it. The tag on sp is load-bearing rather than cosmetic:
+AArch64 exempts [sp, #imm] accesses from tag checking, but not write-back
+forms nor addresses the compiler materialises out of sp into a GPR, and
+those are the accesses that make an attacker's untagged pointer fault. The
+frame record is stored with a write-back form precisely so the first
+instruction after the pivot is tag-checked.
+---
+ arch/arm64/include/asm/mte-rnguard.h | 229 +++++++++++
+ arch/arm64/include/asm/mte.h         |   3 +-
+ arch/arm64/include/asm/stacktrace.h  |  19 +
+ arch/arm64/kernel/Makefile           |   1 +
+ arch/arm64/kernel/mte.c              |  18 +
+ arch/arm64/kernel/rnguard-stack.S    |  46 +++
+ arch/arm64/kernel/stacktrace.c       |   3 +
+ arch/arm64/mm/Makefile               |   1 +
+ arch/arm64/mm/fault.c                |  19 +
+ arch/arm64/mm/mmu.c                  |  12 +-
+ arch/arm64/mm/rnguard_mte.c          | 595 +++++++++++++++++++++++++++
+ mm/kasan/hw_tags.c                   |   2 +-
+ 12 files changed, 944 insertions(+), 4 deletions(-)
+ create mode 100644 arch/arm64/include/asm/mte-rnguard.h
+ create mode 100644 arch/arm64/kernel/rnguard-stack.S
+ create mode 100644 arch/arm64/mm/rnguard_mte.c
+
+diff --git a/arch/arm64/include/asm/mte-rnguard.h b/arch/arm64/include/asm/mte-rnguard.h
+new file mode 100644
+index 0000000..2c6aa58
+--- /dev/null
++++ b/arch/arm64/include/asm/mte-rnguard.h
+@@ -0,0 +1,229 @@
++#ifndef __ASM_MTE_RNGUARD_H
++#define __ASM_MTE_RNGUARD_H
++
++#ifdef CONFIG_RNGUARD_MTE
++
++#include <linux/percpu.h>
++#include <asm/cpufeature.h>
++#include <asm/mte-def.h>
++#include <asm/mte-kasan.h>
++#include <asm/page.h>
++#include <asm/stack_pointer.h>
++
++
++#define RNGUARD_TAG					0xC
++#define RNGUARD_NATIVE_TAG		0xF
++
++static inline void *rnguard_tag_set(const void *addr, u8 tag)
++{
++	return (void *)(((u64)addr & ~MTE_TAG_MASK) |
++									(((u64)tag << MTE_TAG_SHIFT) & MTE_TAG_MASK));
++}
++
++static inline u8 rnguard_tag_get(const void *addr)
++{
++  return (u8)(((u64)addr & MTE_TAG_MASK) >> MTE_TAG_SHIFT);
++}
++
++static inline u8 rnguard_mte_get_mem_tag(void *addr)
++{
++	if (!system_supports_mte())
++		return 0;
++
++	asm(__MTE_PREAMBLE "ldg %0, [%0]"
++		: "+r" (addr));
++
++	return rnguard_tag_get(addr);
++}
++
++static inline u8 rnguard_mte_get_random_tag(void)
++{
++	void *addr;
++
++	if (!system_supports_mte())
++		return 0;
++
++	asm(__MTE_PREAMBLE "irg %0, %0"
++		: "=r" (addr));
++
++	return rnguard_tag_get(addr);
++}
++
++static inline u64 __rnguard_stg_post(u64 p)
++{
++	asm volatile(__MTE_PREAMBLE "stg %0, [%0], #16"
++		     : "+r"(p)
++		     :
++		     : "memory");
++	return p;
++}
++
++static inline void __rnguard_dc_gva(u64 p)
++{
++	asm volatile(__MTE_PREAMBLE "dc gva, %0" : : "r"(p) : "memory");
++}
++
++/*
++ * Assign allocation tags for a region of memory based on the pointer tag.
++ * Note: The address must be non-NULL and MTE_GRANULE_SIZE aligned and
++ * size must be MTE_GRANULE_SIZE aligned.
++ */
++static inline void rnguard_mte_set_mem_tag_range(void *addr, size_t size, u8 tag)
++{
++	u64 curr, mask, dczid, dczid_bs, dczid_dzp, end1, end2, end3;
++
++	if (!system_supports_mte())
++		return;
++
++	/* Read DC G(Z)VA block size from the system register. */
++	dczid = read_cpuid(DCZID_EL0);
++	dczid_bs = 4ul << (dczid & 0xf);
++	dczid_dzp = (dczid >> 4) & 1;
++
++	curr = (u64)rnguard_tag_set(addr, tag);
++	mask = dczid_bs - 1;
++	/* STG/STZG up to the end of the first block. */
++	end1 = curr | mask;
++	end3 = curr + size;
++	/* DC GVA / GZVA in [end1, end2) */
++	end2 = end3 & ~mask;
++
++	/*
++	 * The following code uses STG on the first DC GVA block even if the
++	 * start address is aligned - it appears to be faster than an alignment
++	 * check + conditional branch. Also, if the range size is at least 2 DC
++	 * GVA blocks, the first two loops can use post-condition to save one
++	 * branch each.
++	 */
++	if (!dczid_dzp && size >= 2 * dczid_bs) {
++		do {
++			curr = __rnguard_stg_post(curr);
++		} while (curr < end1);
++
++		do {
++			__rnguard_dc_gva(curr);
++			curr += dczid_bs;
++		} while (curr < end2);
++	}
++
++	while (curr < end3)
++		curr = __rnguard_stg_post(curr);
++}
++
++bool rnguard_addr_is_mte_tagged(unsigned long addr);
++/* Returns true only if this call is what promoted the page. */
++bool rnguard_set_page_mte_tagged(unsigned long addr);
++int rnguard_set_mte_tags(void **ptr, size_t mem_size);
++void dump_mte_registers(void);
++
++#define RNGUARD_STACK_SIZE		PAGE_SIZE
++
++/* Per-CPU pseudo-stack for the RNG's transient state. */
++struct rnguard_stack {
++	u8 guard[PAGE_SIZE];
++	u8 stack[RNGUARD_STACK_SIZE];
++} __aligned(PAGE_SIZE);
++
++DECLARE_PER_CPU_PAGE_ALIGNED(struct rnguard_stack, rnguard_stack);
++
++/* Callers must have interrupts disabled: the region is per-CPU and shared. */
++static __always_inline unsigned long rnguard_stack_base(void)
++{
++	return (unsigned long)raw_cpu_ptr(&rnguard_stack)->stack;
++}
++
++/*
++ * Top of this CPU's pseudo-stack, tagged; sp is pivoted to this value. The tag
++ * is required, not cosmetic: AArch64 exempts sp-plus-immediate accesses from
++ * tag checking but not write-back forms or addresses materialised out of sp
++ * into a GPR, and those checks only pass if sp carries the tag.
++ */
++static __always_inline unsigned long rnguard_stack_top(void)
++{
++	return (unsigned long)rnguard_tag_set((void *)(rnguard_stack_base() +
++						    RNGUARD_STACK_SIZE),
++					   RNGUARD_TAG);
++}
++
++static __always_inline bool on_rnguard_stack(void)
++{
++	unsigned long sp = (unsigned long)__untagged_addr(current_stack_pointer);
++	unsigned long lo = rnguard_stack_base();
++
++	return sp >= lo && sp < lo + RNGUARD_STACK_SIZE;
++}
++
++/* Defined in arch/arm64/kernel/rnguard-stack.S */
++unsigned long rnguard_call_on_stack(unsigned long tos, void *func,
++				 unsigned long arg0, unsigned long arg1);
++
++/*
++ * Run func() on this CPU's pseudo-stack. Interrupts must already be disabled.
++ * The on_rnguard_stack() test mirrors call_on_irqstack_cond(): a nested call must
++ * not reset sp to the top and shred the outer frame.
++ *
++ * Split by arity because the nested case calls func() directly and so needs its
++ * real signature; x86 spells the same thing out with its ASM_CALL_ARGn tokens.
++ */
++#define rnguard_run_on_stack(func)							\
++{										\
++	if (on_rnguard_stack())							\
++		func();								\
++	else									\
++		rnguard_call_on_stack(rnguard_stack_top(), (void *)(func), 0, 0);	\
++}
++
++#define rnguard_run_on_stack_args(func, a0, a1)					\
++{										\
++	if (on_rnguard_stack())							\
++		func((a0), (a1));						\
++	else									\
++		rnguard_call_on_stack(rnguard_stack_top(), (void *)(func),		\
++				   (unsigned long)(a0), (unsigned long)(a1));	\
++}
++
++/* The cast matters: AAPCS64 leaves x0's upper bits unspecified for u8/u16/u32. */
++#define rnguard_run_on_stack_ret(ret, func)					\
++{										\
++	if (on_rnguard_stack())							\
++		(ret) = func();							\
++	else									\
++		(ret) = (typeof(ret))rnguard_call_on_stack(rnguard_stack_top(),	\
++							(void *)(func), 0, 0);	\
++}
++
++int rnguard_mte_init_stacks(void);
++
++#ifdef CONFIG_RNGUARD_MTE_SELFTEST
++/* Record whether an RNG body really executed on the pseudo-stack. */
++#define rnguard_st_record_on_stack(var)	WRITE_ONCE((var), on_rnguard_stack())
++
++void rnguard_selftest_preconditions(void);
++void rnguard_selftest_summary(void);
++void rnguard_selftest_region(const char *what, const void *tagged, size_t size);
++void rnguard_selftest_check(bool cond, const char *what, const char *msg);
++void rnguard_selftest_stack(void);
++void rnguard_selftest_tcf(void);
++
++/*
++ * Nothing should clear SCTLR_EL1.TCF once mte_cpu_setup() has set it: doing so
++ * turns every tag check into a no-op and disables the defense. Called from
++ * mte_thread_switch() to report and undo it if anything ever does.
++ */
++void rnguard_selftest_tcf_tripwire(void);
++#else /* !CONFIG_RNGUARD_MTE_SELFTEST */
++#define rnguard_st_record_on_stack(var)	do { } while (0)
++
++static inline void rnguard_selftest_preconditions(void) { }
++static inline void rnguard_selftest_summary(void) { }
++static inline void rnguard_selftest_region(const char *what,
++					const void *tagged, size_t size) { }
++static inline void rnguard_selftest_check(bool cond, const char *what,
++				       const char *msg) { }
++static inline void rnguard_selftest_stack(void) { }
++static inline void rnguard_selftest_tcf(void) { }
++static inline void rnguard_selftest_tcf_tripwire(void) { }
++#endif /* CONFIG_RNGUARD_MTE_SELFTEST */
++
++#endif /* CONFIG_RNGUARD_MTE */
++#endif /* __ASM_MTE_RNGUARD_H */
+diff --git a/arch/arm64/include/asm/mte.h b/arch/arm64/include/asm/mte.h
+index 0f84518..6394a9c 100644
+--- a/arch/arm64/include/asm/mte.h
++++ b/arch/arm64/include/asm/mte.h
+@@ -173,7 +173,8 @@ static inline void mte_disable_tco_entry(struct task_struct *task)
+ 	 * expensive.
+ 	 */
+ 	if (kasan_hw_tags_enabled() ||
+-	    (task->thread.sctlr_user & (1UL << SCTLR_EL1_TCF0_SHIFT)))
++	    (task->thread.sctlr_user & (1UL << SCTLR_EL1_TCF0_SHIFT)) ||
++			IS_ENABLED(CONFIG_RNGUARD_MTE))
+ 		asm volatile(SET_PSTATE_TCO(0));
+ }
+ 
+diff --git a/arch/arm64/include/asm/stacktrace.h b/arch/arm64/include/asm/stacktrace.h
+index 66ec8ca..93e35b5 100644
+--- a/arch/arm64/include/asm/stacktrace.h
++++ b/arch/arm64/include/asm/stacktrace.h
+@@ -59,6 +59,25 @@ static inline bool on_task_stack(const struct task_struct *tsk,
+ 
+ #define on_thread_stack()	(on_task_stack(current, current_stack_pointer, 1))
+ 
++#ifdef CONFIG_RNGUARD_MTE
++#include <asm/mte-rnguard.h>
++
++/*
++ * The RNG's pseudo-stack. Bounds are reported tagged, to match the fp values
++ * chained through it. Unlike in_rnguard_stack() on x86, the real bounds can be
++ * reported: the unwinder's reads go through those tagged pointers and pass.
++ */
++static inline struct stack_info stackinfo_get_rnguard(void)
++{
++	unsigned long low = rnguard_stack_top() - RNGUARD_STACK_SIZE;
++
++	return (struct stack_info) {
++		.low = low,
++		.high = low + RNGUARD_STACK_SIZE,
++	};
++}
++#endif /* CONFIG_RNGUARD_MTE */
++
+ #ifdef CONFIG_VMAP_STACK
+ DECLARE_PER_CPU(unsigned long [OVERFLOW_STACK_SIZE/sizeof(long)], overflow_stack);
+ 
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 2b112f3..3da96cb 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -68,6 +68,7 @@ obj-$(CONFIG_VMCORE_INFO)		+= vmcore_info.o
+ obj-$(CONFIG_ARM_SDE_INTERFACE)		+= sdei.o
+ obj-$(CONFIG_ARM64_PTR_AUTH)		+= pointer_auth.o
+ obj-$(CONFIG_ARM64_MTE)			+= mte.o
++obj-$(CONFIG_RNGUARD_MTE)		+= rnguard-stack.o
+ obj-y					+= vdso-wrap.o
+ obj-$(CONFIG_COMPAT_VDSO)		+= vdso32-wrap.o
+ 
+diff --git a/arch/arm64/kernel/mte.c b/arch/arm64/kernel/mte.c
+index 6174671..474ab4c 100644
+--- a/arch/arm64/kernel/mte.c
++++ b/arch/arm64/kernel/mte.c
+@@ -21,6 +21,9 @@
+ #include <asm/barrier.h>
+ #include <asm/cpufeature.h>
+ #include <asm/mte.h>
++#ifdef CONFIG_RNGUARD_MTE
++#include <asm/mte-rnguard.h>
++#endif
+ #include <asm/ptrace.h>
+ #include <asm/sysreg.h>
+ 
+@@ -252,6 +255,11 @@ void mte_thread_switch(struct task_struct *next)
+ 	/* TCO may not have been disabled on exception entry for the current task. */
+ 	mte_disable_tco_entry(next);
+ 
++#ifdef CONFIG_RNGUARD_MTE
++	/* Catch anything that turns kernel tag checking off behind our back. */
++	rnguard_selftest_tcf_tripwire();
++#endif
++
+ 	/*
+ 	 * Check if an async tag exception occurred at EL1.
+ 	 *
+@@ -303,6 +311,16 @@ void mte_cpu_setup(void)
+ 	write_sysreg_s(0, SYS_TFSR_EL1);
+ 	write_sysreg_s(0, SYS_TFSRE0_EL1);
+ 
++#ifdef CONFIG_RNGUARD_MTE
++	/*
++	 * With CONFIG_KASAN_HW_TAGS off nothing else sets TCF so EL1 tag checks
++	 * never fire and our tags become useless.
++	 */
++	sysreg_clear_set(sctlr_el1, SCTLR_EL1_TCF_MASK,
++			SYS_FIELD_PREP(SCTLR_EL1, TCF, SCTLR_EL1_TCF_SYNC));
++	isb();
++#endif
++
+ 	local_flush_tlb_all();
+ }
+ 
+diff --git a/arch/arm64/kernel/rnguard-stack.S b/arch/arm64/kernel/rnguard-stack.S
+new file mode 100644
+index 0000000..6350f78
+--- /dev/null
++++ b/arch/arm64/kernel/rnguard-stack.S
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * RNGuard: pivot sp onto this CPU's isolated, MTE-tagged pseudo-stack.
++ */
++
++#include <linux/linkage.h>
++
++/*
++ * unsigned long rnguard_call_on_stack(unsigned long tos, void *func,
++ *				    unsigned long arg0, unsigned long arg1);
++ *
++ *  x0 - top of the pseudo-stack, tagged RNGUARD_TAG, 16-byte aligned
++ *  x1 - function to run on it
++ *  x2 - first argument to func
++ *  x3 - second argument to func
++ *
++ * Returns whatever func returned: x0 is not touched on the way out.
++ *
++ * Interrupts must be disabled at entry. An exception taken while sp is on the
++ * pseudo-stack would push its pt_regs onto the pseudo-stack, run the whole
++ * handler in 4 KiB, and most likely walk into the guard page.
++ */
++SYM_FUNC_START(rnguard_call_on_stack)
++	mov	x9, sp			/* remember the caller's stack */
++	mov	sp, x0			/* pivot; x0 carries RNGUARD_TAG */
++
++	/*
++	 * Frame record first, so the unwinder can walk out of the pseudo-stack
++	 * and back onto the caller's stack. This is a write-back store off sp,
++	 * i.e., a tag-checked access: the first instruction that requires sp's
++	 * tag to match the region's allocation tag.
++	 */
++	stp	x29, x30, [sp, #-16]!
++	mov	x29, sp
++	str	x9, [sp, #-16]!		/* caller's sp; keeps sp 16-byte aligned */
++
++	mov	x9, x1			/* func */
++	mov	x0, x2			/* arg0 */
++	mov	x1, x3			/* arg1 */
++	blr	x9
++
++	ldr	x9, [sp], #16
++	ldp	x29, x30, [sp], #16
++	mov	sp, x9			/* back onto the caller's stack */
++	ret
++SYM_FUNC_END(rnguard_call_on_stack)
+diff --git a/arch/arm64/kernel/stacktrace.c b/arch/arm64/kernel/stacktrace.c
+index 2729faa..0b18159 100644
+--- a/arch/arm64/kernel/stacktrace.c
++++ b/arch/arm64/kernel/stacktrace.c
+@@ -214,6 +214,9 @@ kunwind_stack_walk(kunwind_consume_fn consume_state,
+ 	struct stack_info stacks[] = {
+ 		stackinfo_get_task(task),
+ 		STACKINFO_CPU(irq),
++#ifdef CONFIG_RNGUARD_MTE
++		STACKINFO_CPU(rnguard),
++#endif
+ #if defined(CONFIG_VMAP_STACK)
+ 		STACKINFO_CPU(overflow),
+ #endif
+diff --git a/arch/arm64/mm/Makefile b/arch/arm64/mm/Makefile
+index 2fc8c6d..fbaf80c 100644
+--- a/arch/arm64/mm/Makefile
++++ b/arch/arm64/mm/Makefile
+@@ -11,6 +11,7 @@ obj-$(CONFIG_TRANS_TABLE)	+= trans_pgd.o
+ obj-$(CONFIG_TRANS_TABLE)	+= trans_pgd-asm.o
+ obj-$(CONFIG_DEBUG_VIRTUAL)	+= physaddr.o
+ obj-$(CONFIG_ARM64_MTE)		+= mteswap.o
++obj-$(CONFIG_RNGUARD_MTE)	+= rnguard_mte.o
+ KASAN_SANITIZE_physaddr.o	+= n
+ 
+ obj-$(CONFIG_KASAN)		+= kasan_init.o
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 8b281cf..fa46afe 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -343,6 +343,24 @@ static void do_tag_recovery(unsigned long addr, unsigned long esr,
+ 
+ 	report_tag_fault(addr, esr, regs);
+ 
++#ifdef CONFIG_RNGUARD_MTE
++	/*
++	 * Fail closed. Recovering as below would disable tag checking on this
++	 * CPU and then retry the access, so a single stray write to isolated
++	 * RNG state would switch the defense off and succeed---silently, since
++	 * report_tag_fault() is an empty stub without CONFIG_KASAN_HW_TAGS.
++	 *
++	 * fixup_exception() has already run, so *_kernel_nofault() probes such
++	 * as the RNGuard self-tests never reach here.
++	 */
++	bust_spinlocks(1);
++	pr_alert("[RNGUARD]: tag check fault on isolated RNG state at %016lx (pointer tag %lu)\n",
++		 addr, (addr & MTE_TAG_MASK) >> MTE_TAG_SHIFT);
++	mem_abort_decode(esr);
++	show_pte(addr);
++	show_regs(regs);
++	panic("RNGuard: MTE tag check fault at %016lx", addr);
++#else
+ 	/*
+ 	 * Disable MTE Tag Checking on the local CPU for the current EL.
+ 	 * It will be done lazily on the other CPUs when they will hit a
+@@ -351,6 +369,7 @@ static void do_tag_recovery(unsigned long addr, unsigned long esr,
+ 	sysreg_clear_set(sctlr_el1, SCTLR_EL1_TCF_MASK,
+ 			 SYS_FIELD_PREP_ENUM(SCTLR_EL1, TCF, NONE));
+ 	isb();
++#endif /* CONFIG_RNGUARD_MTE */
+ }
+ 
+ static bool is_el1_mte_sync_tag_check_fault(unsigned long esr)
+diff --git a/arch/arm64/mm/mmu.c b/arch/arm64/mm/mmu.c
+index e55b02f..61ea571 100644
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -665,8 +665,16 @@ static void __init map_mem(pgd_t *pgdp)
+ 		 * if MTE is present. Otherwise, it has the same attributes as
+ 		 * PAGE_KERNEL.
+ 		 */
+-		__map_memblock(pgdp, start, end, pgprot_tagged(PAGE_KERNEL),
+-			       flags);
++#ifndef CONFIG_RNGUARD_MTE
++		__map_memblock(pgdp, start, end, pgprot_tagged(PAGE_KERNEL), flags);
++#else
++		/*
++		 * Here we break userspace MTE protection. The trade-off is that now the
++		 * linear map doesn't have tagged pages by default; we promote only the
++		 * pages we actually protect in rnguard_set_page_mte_tagged().
++		 */
++		__map_memblock(pgdp, start, end, PAGE_KERNEL, flags);
++#endif
+ 	}
+ 
+ 	/*
+diff --git a/arch/arm64/mm/rnguard_mte.c b/arch/arm64/mm/rnguard_mte.c
+new file mode 100644
+index 0000000..3fbf3fa
+--- /dev/null
++++ b/arch/arm64/mm/rnguard_mte.c
+@@ -0,0 +1,595 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#define pr_fmt(fmt) "[RNGUARD]: " fmt
++
++#include <linux/kernel.h>
++#include <linux/pgtable.h>
++#include <linux/mm.h>
++#include <linux/percpu.h>
++#include <linux/set_memory.h>
++#include <asm/memory.h>
++#include <asm/mte-rnguard.h>
++#include <asm/set_memory.h>
++#include <asm/sysreg.h>
++#include <asm/tlbflush.h>
++
++bool rnguard_addr_is_mte_tagged(unsigned long addr)
++{
++	pgd_t *pgdp;
++	p4d_t *p4dp;
++	pud_t *pudp;
++	pmd_t *pmdp;
++	pte_t *ptep, pte;
++	pteval_t pteval;
++
++	/* Get the Page Global Directory (PGD) */
++	pgdp = pgd_offset_k(addr);
++	if (pgd_none(*pgdp) || pgd_bad(*pgdp)) {
++		pr_warn("[!] Problem getting PGD!\n");
++		return false;
++	}
++
++	/* Walk down to P4D */
++	p4dp = p4d_offset(pgdp, addr);
++	if (p4d_none(*p4dp) || p4d_bad(*p4dp)) {
++		pr_warn("[!] Problem getting P4D!\n");
++		return false;
++	}
++
++	/* Walk down to PUD */
++	pudp = pud_offset(p4dp, addr);
++	if (pud_none(*pudp) || pud_bad(*pudp)) {
++		pr_warn("[!] Problem getting PUD!\n");
++		return false;
++	}
++
++	/* Walk down to PMD (Page Middle Directory) */
++	pmdp = pmd_offset(pudp, addr);
++	if (pmd_none(*pmdp) || pmd_bad(*pmdp)) {
++		pr_warn("[!] Problem getting PMD!\n");
++		return false;
++	}
++
++	/* Get the Page Table Entry (PTE) */
++	ptep = pte_offset_kernel(pmdp, addr);
++	if (!ptep) {
++		pr_warn("[!] Problem getting PTE!\n");
++		return false;
++	}
++
++	pte = READ_ONCE(*ptep);
++	if (!pte_present(pte)) {
++		pr_warn("[!] Problem reading PTE pointer!\n");
++		return false;
++	}
++
++	/* Extract the raw PTE val */
++	pteval = pte_val(pte);
++
++	/* Is the PTE marked with MT_NORMAL_TAGGED? */
++	return ((pteval & PTE_ATTRINDX_MASK) == PTE_ATTRINDX(MT_NORMAL_TAGGED));
++}
++
++bool rnguard_set_page_mte_tagged(unsigned long addr)
++{
++	pgd_t *pgdp;
++	p4d_t *p4dp;
++	pud_t *pudp;
++	pmd_t *pmdp;
++	pte_t *ptep, pte;
++
++	/* Align the address to the start of the page */
++	addr &= PAGE_MASK;
++
++	/* Walk the page tables to find the specific PTE */
++	pgdp = pgd_offset_k(addr);
++	if (pgd_none(*pgdp) || pgd_bad(*pgdp))
++		return false;
++
++	p4dp = p4d_offset(pgdp, addr);
++	if (p4d_none(*p4dp) || p4d_bad(*p4dp))
++		return false;
++
++	pudp = pud_offset(p4dp, addr);
++	if (pud_none(*pudp) || pud_bad(*pudp))
++		return false;
++
++	pmdp = pmd_offset(pudp, addr);
++	if (pmd_none(*pmdp) || pmd_bad(*pmdp)) {
++		pr_warn("  [!] 0x%lx is block-mapped; no PTE to promote\n",
++			addr);
++		return false;
++	}
++
++	ptep = pte_offset_kernel(pmdp, addr);
++	if (!ptep)
++		return false;
++
++	pte = READ_ONCE(*ptep);
++	if (!pte_present(pte))
++		return false;
++
++	/* If it is already tagged, bail out to save CPU cycles */
++	if (pte_tagged(pte)) {
++		pr_info("Address %px is already MT_NORMAL_TAGGED\n",
++			(void *)addr);
++		return false;
++	}
++
++	/*
++	 * ARM64 Break-Before-Make (BBM) Sequence
++	 */
++
++	/* BREAK - Clear the current PTE */
++	pte_clear(&init_mm, addr, ptep);
++
++	/* FLUSH - Invalidate the TLB for this specific page */
++	flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
++
++	/* Modify our local copy of the PTE to include the tagged attribute */
++	pte = pfn_pte(pte_pfn(pte), pgprot_tagged(pte_pgprot(pte)));
++
++	/* MAKE - Write the new, tagged PTE to the page table */
++	set_pte_at(&init_mm, addr, ptep, pte);
++
++	/* Ensure the write and CPU pipeline are synchronized before proceeding */
++	isb();
++
++	pr_info("Successfully upgraded page at %px to MT_NORMAL_TAGGED\n",
++		(void *)addr);
++
++	return true;
++}
++
++int rnguard_set_mte_tags(void **ptr, size_t mem_size)
++{
++	void *p = *ptr;
++	unsigned long start, end, addr;
++
++	start = (unsigned long)p & PAGE_MASK;
++	end = PAGE_ALIGN((unsigned long)p + mem_size);
++
++	if (!system_supports_mte()) {
++		pr_err("  [!] MTE unsupported; RNGuard isolation disabled\n");
++		return -EPERM;
++	}
++
++	/*
++	 * We loop here because something like base_crng is only 16-byte aligned
++	 * and can straddle a page boundary.
++	 */
++	for (addr = start; addr < end; addr += PAGE_SIZE) {
++		/*
++		 * Promotion zeroes every granule, so the rest of the page needs
++		 * the tag an ordinary kernel pointer carries. Only on promotion:
++		 * repainting an already-promoted page would wipe the RNGUARD_TAG of
++		 * everything tagged on it earlier.
++		 */
++		if (rnguard_set_page_mte_tagged(addr))
++			rnguard_mte_set_mem_tag_range((void *)addr, PAGE_SIZE,
++						   RNGUARD_NATIVE_TAG);
++	}
++
++	p = rnguard_tag_set(p, RNGUARD_TAG);
++	rnguard_mte_set_mem_tag_range(p, mem_size, RNGUARD_TAG);
++
++	pr_info("  [+] Tagged region: ptrtag=%u, memtag=%u, region size=%zu\n",
++		rnguard_tag_get(p), rnguard_mte_get_mem_tag(p), mem_size);
++
++	*ptr = p;
++	return 0;
++}
++
++DEFINE_PER_CPU_PAGE_ALIGNED(struct rnguard_stack, rnguard_stack);
++
++static int __init rnguard_install_guard_page(unsigned long addr)
++{
++	int ret;
++
++	/*
++	 * set_direct_map_invalid_noflush() silently does nothing on a
++	 * block-mapped linear map, which would leave the bound imaginary.
++	 */
++	if (!can_set_direct_map()) {
++		pr_err("  [!] Linear map is block-mapped; no guard page at 0x%lx\n",
++		       addr);
++		return -EOPNOTSUPP;
++	}
++
++	ret = set_direct_map_invalid_noflush(virt_to_page((void *)addr));
++	if (ret) {
++		pr_err("  [!] Failed to unmap guard page 0x%lx (%d)\n", addr,
++		       ret);
++		return ret;
++	}
++
++	flush_tlb_kernel_range(addr, addr + PAGE_SIZE);
++	pr_info("  [+] Guard page installed at 0x%lx\n", addr);
++
++	return 0;
++}
++
++/* Tag every CPU's pseudo-stack and unmap the guard page below it. */
++int __init rnguard_mte_init_stacks(void)
++{
++	int cpu, ret = 0;
++
++	for_each_online_cpu(cpu) {
++		struct rnguard_stack *ks = per_cpu_ptr(&rnguard_stack, cpu);
++		void *p = ks->stack;
++		int err;
++
++		err = rnguard_set_mte_tags(&p, RNGUARD_STACK_SIZE);
++		if (err)
++			ret = err;
++
++		err = rnguard_install_guard_page((unsigned long)ks->guard);
++		if (err)
++			ret = err;
++	}
++
++	return ret;
++}
++
++static void print_u64_bits_labeled(u64 val)
++{
++	/* Buffers for 64 characters + 1 null terminator */
++	char bit_str[65];
++	char tens_str[65];
++	char ones_str[65];
++	int i, pos = 0;
++
++	/* Loop from the most significant bit (63) down to the least (0) */
++	for (i = 63; i >= 0; i--) {
++		/* Extract the current bit */
++		bit_str[pos] = ((val >> i) & 1) ? '1' : '0';
++
++		/* Format the tens digit (leave blank if < 10 for cleaner look) */
++		tens_str[pos] = (i >= 10) ? ('0' + (i / 10)) : ' ';
++
++		/* Format the ones digit */
++		ones_str[pos] = '0' + (i % 10);
++
++		pos++;
++	}
++
++	/* Null-terminate the strings */
++	bit_str[64] = '\0';
++	tens_str[64] = '\0';
++	ones_str[64] = '\0';
++
++	/* Print them out */
++	pr_info("  Bits: %s\n", bit_str);
++	pr_info("  Idx : %s\n", tens_str);
++	pr_info("        %s\n", ones_str);
++}
++
++/* Shift and mask definitions for MTE control registers */
++#define SCTLR_EL1_ATA_BIT 43
++#define SCTLR_EL1_TCF_SHIFT 40
++
++#define TCR_TBI1_BIT 38
++#define TCR_TCMA1_BIT 58
++
++void dump_mte_registers(void)
++{
++	int i;
++
++	/* Read the system registers */
++	u64 sctlr = read_sysreg(sctlr_el1);
++	u64 tcr = read_sysreg(tcr_el1);
++	u64 mair = read_sysreg(mair_el1);
++
++	/* GCR_EL1 requires read_sysreg_s as the compiler lacks the named alias */
++	u64 gcr = read_sysreg_s(SYS_GCR_EL1);
++
++	pr_info("===== ARM64 MTE Register State =====\n");
++
++	pr_info("SCTLR_EL1 : 0x%016llx\n", sctlr);
++	print_u64_bits_labeled(sctlr);
++	pr_info(" - ATA (Bit 43)    : %llu (1 = Tag access enabled)\n",
++		(sctlr >> SCTLR_EL1_ATA_BIT) & 1);
++	pr_info(" - TCF (Bits 41:40): %llu (0=None, 1=Sync, 2=Async, 3=Asymm)\n",
++		(sctlr >> SCTLR_EL1_TCF_SHIFT) & 0x3ULL);
++
++	pr_info("TCR_EL1   : 0x%016llx\n", tcr);
++	print_u64_bits_labeled(tcr);
++	pr_info(" - TBI1 (Bit 38)   : %llu (1 = Top Byte Ignore enabled for TTBR1)\n",
++		(tcr >> TCR_TBI1_BIT) & 1);
++	pr_info(" - TCMA1 (Bit 58)  : %llu (1 = Tag Check Mask Override enabled)\n",
++		(tcr >> TCR_TCMA1_BIT) & 1);
++
++	pr_info("MAIR_EL1  : 0x%016llx\n", mair);
++	print_u64_bits_labeled(mair);
++	for (i = 0; i < 8; i++) {
++		u8 attr = (mair >> (i * 8)) & 0xFF;
++
++		pr_info(" - Attr%d : 0x%02x %s\n", i, attr,
++			(attr == 0xF0) ? "<-- Tagged Memory (MTE)!" : "");
++	}
++
++	/* Extract GCR-related fields */
++	u8 gcr_rrnd = (gcr >> 16) & 1;
++	u16 gcr_exclude = gcr & SYS_GCR_EL1_EXCL_MASK;
++
++	pr_info("GCR_EL1   : 0x%016llx\n", gcr);
++	print_u64_bits_labeled(gcr);
++	pr_info(" - RRND (Bit 16) : %u (1 = Random, 0 = Deterministic)\n",
++		gcr_rrnd);
++	pr_info(" - Exclude Mask  : 0x%04x\n", gcr_exclude);
++	if (gcr_exclude) {
++		pr_info("  - Excluded Tags : ");
++		for (i = 0; i < 16; i++) {
++			if (gcr_exclude & (1 << i))
++				pr_cont("%x ", i);
++		}
++		pr_cont("\n");
++	}
++
++	pr_info("====================================\n");
++}
++
++#ifdef CONFIG_RNGUARD_MTE_SELFTEST
++
++static unsigned int rnguard_st_total;
++static unsigned int rnguard_st_pass;
++static unsigned int rnguard_st_fail;
++
++#define RNGUARD_ST(cond, fmt, ...)                                          \
++	do {                                                             \
++		rnguard_st_total++;                                         \
++		if (cond) {                                              \
++			rnguard_st_pass++;                                  \
++			pr_info("  [+] PASS: " fmt "\n", ##__VA_ARGS__); \
++		} else {                                                 \
++			rnguard_st_fail++;                                  \
++			pr_err("  [!] FAIL: " fmt "\n", ##__VA_ARGS__);  \
++		}                                                        \
++	} while (0)
++
++/*
++ * These emit an exception-table entry, so a tag check fault returns false
++ * instead of dying.
++ */
++static bool rnguard_probe_read(const void *addr, u64 *out)
++{
++	__get_kernel_nofault(out, addr, u64, fault);
++	return true;
++fault:
++	return false;
++}
++
++static bool rnguard_probe_write(void *addr, u64 val)
++{
++	__put_kernel_nofault(addr, &val, u64, fault);
++	return true;
++fault:
++	return false;
++}
++
++void rnguard_selftest_preconditions(void)
++{
++	u64 sctlr = read_sysreg(sctlr_el1);
++	u64 tcr = read_sysreg(tcr_el1);
++	u64 tcf = FIELD_GET(SCTLR_EL1_TCF_MASK, sctlr);
++
++	pr_info("Running RNGUARD MTE precondition self-tests (CPU#%d)\n",
++		smp_processor_id());
++
++	/* Ensure MTE is available */
++	RNGUARD_ST(system_supports_mte(), "CPU supports MTE");
++	RNGUARD_ST(sctlr & SCTLR_ELx_ATA,
++		"SCTLR_EL1.ATA = 1 (tag access enabled)");
++
++	/* TCF = 0 means no kernel tag check ever faults and our tags are useless */
++	RNGUARD_ST(tcf == SCTLR_EL1_TCF_SYNC,
++		"SCTLR_EL1.TCF = SYNC (is %llu: 0=off 1=sync 2=async 3=asymm)",
++		tcf);
++
++	/* Ensure we have the top byte ignore set */
++	RNGUARD_ST(tcr & TCR_TBI1,
++		"TCR_EL1.TBI1 = 1 (tagged kernel pointers translate)");
++
++	/*
++	 * TCMA1 exempts tag 0b0000 and 0b1111 pointers from checking. Thus, we
++	 * want TCMA1 off so an attacker can't just set a 0xF tag and bypass things.
++	 */
++	RNGUARD_ST(!(tcr & TCR_TCMA1),
++		"TCR_EL1.TCMA1 = 0 (tag 0x0/0xF pointers are NOT exempt)");
++	RNGUARD_ST(!IS_ENABLED(CONFIG_KASAN_HW_TAGS),
++		"CONFIG_KASAN_HW_TAGS=n (it sets TCMA1)");
++
++	/* Confirm linear map isn't taggable (i.e., MT_NORMAL_TAGGED) by default */
++	RNGUARD_ST(!rnguard_addr_is_mte_tagged((unsigned long)lm_alias(_text)),
++		"linear map is not MT_NORMAL_TAGGED");
++}
++
++void rnguard_selftest_region(const char *what, const void *tagged, size_t size)
++{
++	const void *untagged = (const void *)__untagged_addr((u64)tagged);
++	void *wrongtag = rnguard_tag_set(tagged, RNGUARD_TAG ^ 1);
++	unsigned int granules = 0, bad = 0;
++	unsigned long addr;
++	u64 saved, scratch;
++
++	pr_info("Self-testing region '%s' at %px (%zu bytes)\n", what, tagged,
++		size);
++
++	/* Check that the tagged pointer is tagged correctly */
++	RNGUARD_ST(rnguard_tag_get(tagged) == RNGUARD_TAG, "%s: pointer tag is %u", what,
++		RNGUARD_TAG);
++
++	/*
++	 * STG needs granule alignment; a misaligned base silently leaves the
++	 * leading granule untagged
++	 */
++	RNGUARD_ST(IS_ALIGNED((u64)tagged, MTE_GRANULE_SIZE),
++		"%s: base is MTE_GRANULE_SIZE aligned", what);
++
++	/* Tag checks happen only on MT_NORMAL_TAGGED mappings. */
++	RNGUARD_ST(rnguard_addr_is_mte_tagged((unsigned long)untagged),
++		"%s: page is MT_NORMAL_TAGGED", what);
++
++	/*
++	 * Catches mte_sync_tags() having zeroed the page after we tagged it:
++	 * set_pte_at() -> __set_ptes() clears tags on first tagging
++	 */
++	for (addr = (unsigned long)tagged; addr < (unsigned long)tagged + size;
++	     addr += MTE_GRANULE_SIZE) {
++		granules++;
++		if (rnguard_mte_get_mem_tag((void *)addr) != RNGUARD_TAG)
++			bad++;
++	}
++	RNGUARD_ST(!bad, "%s: all %u granule(s) tagged %u (%u bad)", what,
++		granules, RNGUARD_TAG, bad);
++
++	/*
++	 * The granule just past the region must not carry RNGUARD_TAG: proves we
++	 * tagged the object and not the whole page.
++	 */
++	RNGUARD_ST(rnguard_mte_get_mem_tag((void *)((unsigned long)tagged + size)) !=
++			RNGUARD_TAG,
++		"%s: granule past the region is not tagged %u", what, RNGUARD_TAG);
++
++	/*
++	 * Read first so every write below can put back the value it found.
++	 * This is live RNG state; a "successful" write must not corrupt it.
++	 */
++	RNGUARD_ST(rnguard_probe_read(tagged, &saved),
++		"%s: read via tagged pointer succeeds", what);
++	RNGUARD_ST(rnguard_probe_write((void *)tagged, saved),
++		"%s: write via tagged pointer succeeds", what);
++
++	/*
++	 * An ordinary kernel pointer to the same address, which is
++	 * what an arbitrary-write primitive holds, must fault.
++	 */
++	RNGUARD_ST(!rnguard_probe_read(untagged, &scratch),
++		"%s: read via untagged pointer %px FAULTS", what, untagged);
++	RNGUARD_ST(!rnguard_probe_write((void *)untagged, saved),
++		"%s: write via untagged pointer FAULTS", what);
++
++	/* Proves tag matching, not merely tagged-vs-untagged. */
++	RNGUARD_ST(!rnguard_probe_write(wrongtag, saved),
++		"%s: write via wrong tag %u FAULTS", what, RNGUARD_TAG ^ 1);
++}
++
++/*
++ * Generic counted assertion, for checks whose logic has to live in the
++ * caller but whose result should still land in the pass/fail tally below.
++ */
++void rnguard_selftest_check(bool cond, const char *what, const char *msg)
++{
++	RNGUARD_ST(cond, "%s: %s", what, msg);
++}
++
++/*
++ * Not rnguard_selftest_region(): that probes the granule past the region, which
++ * here is a neighbouring per-CPU object rather than something we tagged.
++ */
++void rnguard_selftest_stack(void)
++{
++	struct rnguard_stack *ks = raw_cpu_ptr(&rnguard_stack);
++	unsigned long lo = (unsigned long)ks->stack;
++	void *tagged = rnguard_tag_set(ks->stack, RNGUARD_TAG);
++	unsigned int granules = 0, bad = 0;
++	unsigned long addr;
++	u64 scratch;
++
++	pr_info("Self-testing pseudo-stack at %px (%lu bytes)\n", tagged,
++		(unsigned long)RNGUARD_STACK_SIZE);
++
++	RNGUARD_ST(rnguard_addr_is_mte_tagged(lo),
++		"rnguard_stack: page is MT_NORMAL_TAGGED");
++	RNGUARD_ST(IS_ALIGNED(lo, MTE_GRANULE_SIZE),
++		"rnguard_stack: base is MTE_GRANULE_SIZE aligned");
++	RNGUARD_ST(IS_ALIGNED(lo + RNGUARD_STACK_SIZE, 16),
++		"rnguard_stack: top is 16-byte aligned (SP alignment check)");
++
++	for (addr = lo; addr < lo + RNGUARD_STACK_SIZE; addr += MTE_GRANULE_SIZE) {
++		granules++;
++		if (rnguard_mte_get_mem_tag((void *)addr) != RNGUARD_TAG)
++			bad++;
++	}
++	RNGUARD_ST(!bad, "rnguard_stack: all %u granule(s) tagged %u (%u bad)",
++		granules, RNGUARD_TAG, bad);
++
++	/*
++	 * Probes target the bottom of the stack, which is only reached on a deep
++	 * frame and holds nothing live at init time.
++	 */
++	RNGUARD_ST(rnguard_probe_write(tagged, 0),
++		"rnguard_stack: write via tagged pointer succeeds");
++	RNGUARD_ST(!rnguard_probe_write(ks->stack, 0),
++		"rnguard_stack: write via untagged pointer %px FAULTS", ks->stack);
++	RNGUARD_ST(!rnguard_probe_write(rnguard_tag_set(ks->stack, RNGUARD_TAG ^ 1), 0),
++		"rnguard_stack: write via wrong tag %u FAULTS", RNGUARD_TAG ^ 1);
++
++	/* Overflow bound: the guard must be gone in both aliases. */
++	RNGUARD_ST(!rnguard_probe_read(ks->guard, &scratch),
++		"rnguard_stack: guard page %px is unmapped", ks->guard);
++	RNGUARD_ST(!rnguard_probe_read(rnguard_tag_set(ks->guard, RNGUARD_TAG), &scratch),
++		"rnguard_stack: guard page is unmapped for a tagged pointer too");
++}
++
++/*
++ * Tags are worthless if kernel tag checking gets turned off behind our back,
++ * and every other test would still pass. Report it, then put it back.
++ */
++void rnguard_selftest_tcf_tripwire(void)
++{
++	static atomic_t reports = ATOMIC_INIT(0);
++	u64 sctlr = read_sysreg(sctlr_el1);
++	int n;
++
++	if (likely(FIELD_GET(SCTLR_EL1_TCF_MASK, sctlr) == SCTLR_EL1_TCF_SYNC))
++		return;
++
++	n = atomic_inc_return(&reports);
++	if (n <= 3) {
++		pr_warn("CPU%d: SCTLR_EL1.TCF was cleared (sctlr=0x%016llx), repairing\n",
++			raw_smp_processor_id(), sctlr);
++		if (n == 1)
++			dump_stack();
++	}
++
++	sysreg_clear_set(sctlr_el1, SCTLR_EL1_TCF_MASK,
++			 SYS_FIELD_PREP(SCTLR_EL1, TCF, SCTLR_EL1_TCF_SYNC));
++	isb();
++}
++
++static DEFINE_PER_CPU(u64, rnguard_st_sctlr);
++
++static void rnguard_st_read_sctlr(void *unused)
++{
++	__this_cpu_write(rnguard_st_sctlr, read_sysreg(sctlr_el1));
++}
++
++/* Kernel tag checking must still be enabled on every CPU. */
++void rnguard_selftest_tcf(void)
++{
++	int cpu;
++
++	on_each_cpu(rnguard_st_read_sctlr, NULL, 1);
++
++	for_each_online_cpu(cpu) {
++		u64 tcf = FIELD_GET(SCTLR_EL1_TCF_MASK,
++				    per_cpu(rnguard_st_sctlr, cpu));
++
++		RNGUARD_ST(tcf == SCTLR_EL1_TCF_SYNC,
++			"CPU#%d: kernel tag checking still enabled (TCF=%llu)",
++			cpu, tcf);
++	}
++}
++
++void rnguard_selftest_summary(void)
++{
++	if (!rnguard_st_total)
++		pr_warn("RNGUARD MTE self-tests: none ran\n");
++	else if (rnguard_st_fail)
++		pr_err("RNGUARD MTE self-tests: %u PASSED, %u FAILED (%u TOTAL)\n",
++		       rnguard_st_pass, rnguard_st_fail, rnguard_st_total);
++	else
++		pr_info("RNGUARD MTE self-tests: all %u PASSED!\n", rnguard_st_pass);
++}
++
++#endif /* CONFIG_RNGUARD_MTE_SELFTEST */
+diff --git a/mm/kasan/hw_tags.c b/mm/kasan/hw_tags.c
+index 9958ebc..d1a3d9a 100644
+--- a/mm/kasan/hw_tags.c
++++ b/mm/kasan/hw_tags.c
+@@ -207,7 +207,7 @@ void kasan_init_hw_tags_cpu(void)
+ 	 * When this function is called, kasan_flag_enabled is not yet
+ 	 * set by kasan_init_hw_tags(). Thus, check kasan_arg instead.
+ 	 */
+-	if (kasan_arg == KASAN_ARG_OFF)
++	if ((kasan_arg == KASAN_ARG_OFF) && !IS_ENABLED(CONFIG_RNGUARD_MTE))
+ 		return;
+ 
+ 	/*

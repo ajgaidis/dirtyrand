@@ -1,0 +1,3 @@
+kprobe:crng_reseed {
+	printf("%llu\n", nsecs / 1000000);
+}

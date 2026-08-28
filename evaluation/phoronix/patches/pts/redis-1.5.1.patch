@@ -1,0 +1,16 @@
+--- a/redis
++++ b/redis
+@@ -1,8 +1,13 @@
+ #!/bin/bash
+ cd ~/redis-8.6.0
+ 
++# save "" disables RDB snapshots. Without it redis keeps its default save
++# points (3600 1 300 100 60 10000), so SIGTERM below writes a dump.rdb that
++# the NEXT run loads -- the keyspace accumulates across runs until the load
++# outgrows RAM and redis-benchmark only ever sees "LOADING".
+ echo "io-threads 8
+ io-threads-do-reads yes
++save \"\"
+ tcp-keepalive 0" > redis.conf
+ 
+ ./src/redis-server redis.conf &

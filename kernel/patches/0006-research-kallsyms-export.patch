@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous Submission #60 <anon@example.invalid>
+Date: Fri, 28 Aug 2026 12:58:06 -0400
+Subject: [PATCH] DO NOT DEPLOY: export kallsyms_lookup_name() to modules
+
+The synthetic primitive module (attack/primitives/kmod) resolves RNG symbols
+such as base_crng, net_secret and table_perturb by name at load time, so the
+case studies can be driven without hardcoding an offset per build.
+kallsyms_lookup_name() was unexported in v5.7 precisely to stop out-of-tree
+modules doing this.
+
+This is research instrumentation rather than a re-introduced CVE: it is what
+makes the synthetic primitive usable, and it is not required by the
+CVE-2022-34918 path, which derives its offsets from vmlinux at build time.
+
+Handing every loadable module an address-of-any-symbol lookup is a
+substantial weakening on its own. Apply only to a disposable VM.
+---
+ kernel/kallsyms.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/kernel/kallsyms.c b/kernel/kallsyms.c
+index a9a0ca6..2d1f3d1 100644
+--- a/kernel/kallsyms.c
++++ b/kernel/kallsyms.c
+@@ -242,6 +242,7 @@ unsigned long kallsyms_lookup_name(const char *name)
+ 
+ 	return module_kallsyms_lookup_name(name);
+ }
++EXPORT_SYMBOL_GPL(kallsyms_lookup_name);
+ 
+ /*
+  * Iterate over all symbols in vmlinux.  For symbols from modules use

@@ -1,0 +1,10 @@
+kprobe:queue_work_on {
+	$wq_name = ((struct workqueue_struct *) arg1)->name;
+	$work_name = ((struct work_struct *) arg2)->func;
+
+	if ($wq_name == "events_unbound") {
+		printf("%d,%d,%s,%p\n", pid, arg0, $wq_name, $work_name);	
+		printf("%s\n", kstack());
+	}
+}
+

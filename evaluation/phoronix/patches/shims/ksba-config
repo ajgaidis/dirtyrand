@@ -1,0 +1,18 @@
+#!/bin/sh
+# Compat shim: Debian 12's libksba-dev ships only ksba.pc, no ksba-config.
+# GnuPG 2.2.x's m4/ksba.m4 needs --version/--api-version/--cflags/--libs.
+mod=ksba
+out=
+for arg in "$@"; do
+  case "$arg" in
+    --version)     out="$out $(pkg-config --modversion $mod)" ;;
+    --api-version) out="$out $(pkg-config --variable=api_version $mod)" ;;
+    --cflags)      out="$out $(pkg-config --cflags $mod)" ;;
+    --libs)        out="$out $(pkg-config --libs $mod)" ;;
+    --prefix)      out="$out $(pkg-config --variable=prefix $mod)" ;;
+    --exec-prefix) out="$out $(pkg-config --variable=exec_prefix $mod)" ;;
+    --prefix=*|--exec-prefix=*|--mt) ;;
+    *) echo "ksba-config: unknown option $arg" >&2; exit 1 ;;
+  esac
+done
+echo $out

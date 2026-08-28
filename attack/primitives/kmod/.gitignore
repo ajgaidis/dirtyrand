@@ -1,0 +1,12 @@
+*.o
+*.so
+*.ko
+*.cmd
+*.mod
+*.mod.c
+*.order
+*.symvers
+.cache/
+old/
+main
+exploit

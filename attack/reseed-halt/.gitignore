@@ -1,0 +1,22 @@
+# Kbuild outputs
+*.o
+*.ko
+*.so
+*.mod
+*.mod.c
+*.cmd
+*.order
+*.symvers
+.cache/
+.tmp_versions/
+
+# Generated at build time
+inc/offsets.h
+
+# Built binaries
+exploit
+offsets
+pty_write
+
+# Captured RNG output
+random_data.bin
